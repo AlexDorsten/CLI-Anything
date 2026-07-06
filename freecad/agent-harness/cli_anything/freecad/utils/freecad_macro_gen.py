@@ -229,6 +229,86 @@ def _placement_expr(placement: Optional[Dict[str, Any]]) -> Optional[str]:
     )
 
 
+# Sketch plane placements follow the FreeCAD body-origin conventions:
+# XY is identity (normal +z), XZ is rotated 90 deg about +x (normal -y),
+# YZ is rotated 120 deg about (1,1,1) (normal +x). The stored sketch
+# ``offset`` is applied along the plane normal.
+_SKETCH_PLANE_PLACEMENTS = {
+    "XY": ("FreeCAD.Rotation()", (0.0, 0.0, 1.0)),
+    "XZ": ("FreeCAD.Rotation(FreeCAD.Vector(1, 0, 0), 90)", (0.0, -1.0, 0.0)),
+    "YZ": ("FreeCAD.Rotation(FreeCAD.Vector(1, 1, 1), 120)", (1.0, 0.0, 0.0)),
+}
+
+
+def _profile_sketch(project: dict, feat: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resolve the sketch referenced by a sketch-based feature, if any."""
+    sketch_index = feat.get("sketch_index")
+    if not isinstance(sketch_index, int):
+        return None
+    sketches = project.get("sketches", [])
+    if sketch_index < 0 or sketch_index >= len(sketches):
+        return None
+    sketch = sketches[sketch_index]
+    return sketch if isinstance(sketch, dict) else None
+
+
+def _emit_profile_sketch(
+    lines: List[str],
+    body_var: str,
+    sketch: Dict[str, Any],
+    sketch_var: str,
+) -> bool:
+    """Emit a Sketcher::SketchObject inside the body for a feature profile.
+
+    Renders line and circle elements (the closed-outline building blocks the
+    sketch CLI records); other element types produce a warning comment. Returns
+    True when at least one geometry element was emitted, so the caller only
+    binds Profile to sketches that can actually form a face.
+    """
+    elements = sketch.get("elements", [])
+    supported = [
+        element
+        for element in elements
+        if isinstance(element, dict) and element.get("type") in {"line", "circle"}
+    ]
+    if not supported:
+        return False
+
+    sketch_name = _safe_name(sketch.get("name", "ProfileSketch"))
+    plane = str(sketch.get("plane", "XY")).upper()
+    rotation_expr, normal = _SKETCH_PLANE_PLACEMENTS.get(plane, _SKETCH_PLANE_PLACEMENTS["XY"])
+    offset = float(sketch.get("offset", 0.0))
+    origin = tuple(component * offset for component in normal)
+    lines.append(f"{sketch_var} = {body_var}.newObject('Sketcher::SketchObject', '{sketch_name}')")
+    lines.append(
+        f"{sketch_var}.Placement = FreeCAD.Placement("
+        f"FreeCAD.Vector({origin[0]}, {origin[1]}, {origin[2]}), {rotation_expr})"
+    )
+    for element in elements:
+        element_type = element.get("type") if isinstance(element, dict) else None
+        if element_type == "line":
+            start = element.get("start", [0.0, 0.0])
+            end = element.get("end", [0.0, 0.0])
+            lines.append(
+                f"{sketch_var}.addGeometry(Part.LineSegment("
+                f"FreeCAD.Vector({float(start[0])}, {float(start[1])}, 0), "
+                f"FreeCAD.Vector({float(end[0])}, {float(end[1])}, 0)), False)"
+            )
+        elif element_type == "circle":
+            center = element.get("center", [0.0, 0.0])
+            radius = float(element.get("radius", 1.0))
+            lines.append(
+                f"{sketch_var}.addGeometry(Part.Circle("
+                f"FreeCAD.Vector({float(center[0])}, {float(center[1])}, 0), "
+                f"FreeCAD.Vector(0, 0, 1), {radius}), False)"
+            )
+        else:
+            lines.append(
+                f"# WARNING: Skipping unsupported sketch element type '{element_type}' in '{sketch_name}'"
+            )
+    return True
+
+
 def _dominant_axis(direction: Any) -> tuple[str, bool, bool]:
     """Resolve a direction vector to the closest body-origin axis."""
     if not isinstance(direction, (list, tuple)) or len(direction) != 3:
@@ -250,6 +330,7 @@ def _gen_bodies(project: dict) -> List[str]:
         return lines
 
     lines.append("import PartDesign")
+    lines.append("import Sketcher")
     lines.append("")
     lines.extend(
         [
@@ -445,11 +526,32 @@ def _gen_bodies(project: dict) -> List[str]:
                     )
 
             elif feat_type == "pad":
-                length = feat_props.get("length", feat_props.get("Length", 10.0))
+                length = feat.get("length", feat_props.get("length", feat_props.get("Length", 10.0)))
+                profile_var: Optional[str] = None
+                sketch = _profile_sketch(project, feat)
+                if sketch is not None:
+                    candidate_var = f"sketch_{body_name}_{feature_counter}"
+                    if _emit_profile_sketch(lines, body_var, sketch, candidate_var):
+                        profile_var = candidate_var
+                    else:
+                        lines.append(
+                            f"# WARNING: Pad '{feat_name}' references sketch without supported geometry"
+                        )
+                elif feat.get("sketch_index") is not None:
+                    lines.append(
+                        f"# WARNING: Pad '{feat_name}' references unknown sketch index {feat.get('sketch_index')!r}"
+                    )
                 lines.append(
                     f"{feat_var} = {body_var}.newObject('PartDesign::Pad', '{feat_name}')"
                 )
-                lines.append(f"{feat_var}.Length = {length}")
+                if profile_var is not None:
+                    lines.append(f"{feat_var}.Profile = {profile_var}")
+                    lines.append(f"{profile_var}.Visibility = False")
+                lines.append(f"{feat_var}.Length = {float(length)}")
+                if feat.get("reversed"):
+                    lines.append(f"{feat_var}.Reversed = True")
+                if feat.get("symmetric"):
+                    lines.append(f"{feat_var}.Midplane = True")
                 previous_var = feat_var
 
             elif feat_type == "pocket":

@@ -651,6 +651,82 @@ class TestBody:
         assert ".Size = 1.0" in macro
         assert ".Radius = 2.5" in macro
 
+    def test_macro_binds_pad_profile_sketch(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "pad-profile-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "sketches": [
+                {
+                    "id": 1,
+                    "name": "BaseOutline",
+                    "plane": "XY",
+                    "offset": 0.0,
+                    "elements": [
+                        {"id": 1, "type": "line", "start": [0.0, 0.0], "end": [30.0, 0.0]},
+                        {"id": 2, "type": "line", "start": [30.0, 0.0], "end": [30.0, 10.0]},
+                        {"id": 3, "type": "line", "start": [30.0, 10.0], "end": [0.0, 10.0]},
+                        {"id": 4, "type": "line", "start": [0.0, 10.0], "end": [0.0, 0.0]},
+                    ],
+                    "constraints": [],
+                    "closed": True,
+                }
+            ],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "pad",
+                            "sketch_index": 0,
+                            "sketch_name": "BaseOutline",
+                            "length": 16.0,
+                            "symmetric": False,
+                            "reversed": False,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "newObject('Sketcher::SketchObject', 'BaseOutline')" in macro
+        assert macro.count("Part.LineSegment(") == 4
+        assert "FreeCAD.Vector(30.0, 10.0, 0)" in macro
+        assert ".Profile = sketch_MainBody_1" in macro
+        assert ".Length = 16.0" in macro
+        assert "sketch_MainBody_1.Visibility = False" in macro
+
+    def test_macro_pad_without_resolvable_sketch_keeps_previous_behavior(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "pad-orphan-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "sketches": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {"id": 1, "type": "pad", "sketch_index": 3, "length": 5.0}
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "WARNING: Pad" in macro
+        assert ".Profile =" not in macro
+        assert ".Length = 5.0" in macro
+
     def test_revolution(self):
         proj = self._project_with_sketch()
         create_body(proj)
