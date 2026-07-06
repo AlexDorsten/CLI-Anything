@@ -29,7 +29,7 @@ VALID_REVOLUTION_AXES = {"X", "Y", "Z"}
 # Semantic edge selectors accepted by fillet/chamfer besides explicit index
 # lists. A tuple (not a set) so unhashable list arguments can be membership
 # tested without raising.
-EDGE_SELECTORS = ("all", "bottom_rim")
+EDGE_SELECTORS = ("all", "bottom_rim", "vertical_outer")
 VALID_PATTERN_PLANES = {"XY", "XZ", "YZ"}
 VALID_THREAD_STANDARDS = {"metric", "BSW", "BSF", "BSP", "NPT"}
 VALID_ATTACHMENT_MODES = {

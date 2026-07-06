@@ -1294,7 +1294,7 @@ def body_pocket(body_index: int, sketch_index: int, length: float,
 @body_group.command("fillet")
 @click.argument("body_index", type=int)
 @click.option("--radius", "-r", default=1.0, type=float, help="Fillet radius.")
-@click.option("--edges", default="all", help="Edges: named selector ('all', 'bottom_rim') or comma-sep indices.")
+@click.option("--edges", default="all", help="Edges: named selector ('all', 'bottom_rim', 'vertical_outer') or comma-sep indices.")
 @handle_error
 def body_fillet(body_index: int, radius: float, edges: str) -> None:
     """Add a fillet feature to a body."""
@@ -1309,7 +1309,7 @@ def body_fillet(body_index: int, radius: float, edges: str) -> None:
 @body_group.command("chamfer")
 @click.argument("body_index", type=int)
 @click.option("--size", "-s", default=1.0, type=float, help="Chamfer size.")
-@click.option("--edges", default="all", help="Edges: named selector ('all', 'bottom_rim') or comma-sep indices.")
+@click.option("--edges", default="all", help="Edges: named selector ('all', 'bottom_rim', 'vertical_outer') or comma-sep indices.")
 @handle_error
 def body_chamfer(body_index: int, size: float, edges: str) -> None:
     """Add a chamfer feature to a body."""
