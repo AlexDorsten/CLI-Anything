@@ -26,6 +26,10 @@ VALID_FEATURE_TYPES = {
     "local_coordinate_system",
 }
 VALID_REVOLUTION_AXES = {"X", "Y", "Z"}
+# Semantic edge selectors accepted by fillet/chamfer besides explicit index
+# lists. A tuple (not a set) so unhashable list arguments can be membership
+# tested without raising.
+EDGE_SELECTORS = ("all", "bottom_rim")
 VALID_PATTERN_PLANES = {"XY", "XZ", "YZ"}
 VALID_THREAD_STANDARDS = {"metric", "BSW", "BSF", "BSP", "NPT"}
 VALID_ATTACHMENT_MODES = {
@@ -300,9 +304,11 @@ def fillet(
     if radius <= 0:
         raise ValueError(f"Fillet radius must be positive, got {radius}")
 
-    if edges != "all":
+    if edges not in EDGE_SELECTORS:
         if not isinstance(edges, (list, tuple)):
-            raise ValueError("Edges must be 'all' or a list of edge indices")
+            raise ValueError(
+                f"Edges must be one of {sorted(EDGE_SELECTORS)} or a list of edge indices"
+            )
         for idx in edges:
             if not isinstance(idx, int) or idx < 0:
                 raise ValueError(f"Edge index must be a non-negative integer, got {idx!r}")
@@ -353,9 +359,11 @@ def chamfer(
     if size <= 0:
         raise ValueError(f"Chamfer size must be positive, got {size}")
 
-    if edges != "all":
+    if edges not in EDGE_SELECTORS:
         if not isinstance(edges, (list, tuple)):
-            raise ValueError("Edges must be 'all' or a list of edge indices")
+            raise ValueError(
+                f"Edges must be one of {sorted(EDGE_SELECTORS)} or a list of edge indices"
+            )
         for idx in edges:
             if not isinstance(idx, int) or idx < 0:
                 raise ValueError(f"Edge index must be a non-negative integer, got {idx!r}")

@@ -259,6 +259,35 @@ def _gen_bodies(project: dict) -> List[str]:
             "            return origin_obj",
             "    raise RuntimeError(f'Could not resolve body origin role: {role}')",
             "",
+            "def _finishing_edges(shape, spec):",
+            "    if spec == 'all':",
+            "        return ['Edge%d' % (index + 1) for index in range(len(shape.Edges))]",
+            "    if isinstance(spec, (list, tuple)):",
+            "        return ['Edge%d' % int(index) for index in spec]",
+            "    if spec == 'bottom_rim':",
+            "        bound_box = shape.BoundBox",
+            "        tolerance = max(bound_box.DiagonalLength * 1e-4, 1e-5)",
+            "        names = []",
+            "        for index, edge in enumerate(shape.Edges):",
+            "            vertexes = edge.Vertexes",
+            "            if not vertexes:",
+            "                continue",
+            "            if any(abs(vertex.Point.z - bound_box.ZMin) > tolerance for vertex in vertexes):",
+            "                continue",
+            "            center = edge.CenterOfMass",
+            "            on_outer_boundary = (",
+            "                abs(center.x - bound_box.XMin) <= tolerance",
+            "                or abs(center.x - bound_box.XMax) <= tolerance",
+            "                or abs(center.y - bound_box.YMin) <= tolerance",
+            "                or abs(center.y - bound_box.YMax) <= tolerance",
+            "            )",
+            "            if on_outer_boundary:",
+            "                names.append('Edge%d' % (index + 1))",
+            "        if not names:",
+            "            raise RuntimeError('bottom_rim selected no edges')",
+            "        return names",
+            "    raise RuntimeError('Unknown edge selector: %r' % (spec,))",
+            "",
         ]
     )
 
@@ -412,20 +441,36 @@ def _gen_bodies(project: dict) -> List[str]:
                 previous_var = feat_var
 
             elif feat_type == "chamfer":
-                size = feat_props.get("size", feat_props.get("Size", 1.0))
-                lines.append(
-                    f"{feat_var} = {body_var}.newObject('PartDesign::Chamfer', '{feat_name}')"
-                )
-                lines.append(f"{feat_var}.Size = {size}")
-                previous_var = feat_var
+                size = feat.get("size", feat_props.get("size", feat_props.get("Size", 1.0)))
+                edges_spec = feat.get("edges", feat_props.get("edges", "all"))
+                if previous_var is None:
+                    lines.append(f"# WARNING: Cannot chamfer '{feat_name}' without a previous body feature")
+                else:
+                    lines.append("doc.recompute()")
+                    lines.append(
+                        f"{feat_var} = {body_var}.newObject('PartDesign::Chamfer', '{feat_name}')"
+                    )
+                    lines.append(
+                        f"{feat_var}.Base = ({previous_var}, _finishing_edges({previous_var}.Shape, {edges_spec!r}))"
+                    )
+                    lines.append(f"{feat_var}.Size = {size}")
+                    previous_var = feat_var
 
             elif feat_type == "fillet":
-                radius = feat_props.get("radius", feat_props.get("Radius", 1.0))
-                lines.append(
-                    f"{feat_var} = {body_var}.newObject('PartDesign::Fillet', '{feat_name}')"
-                )
-                lines.append(f"{feat_var}.Radius = {radius}")
-                previous_var = feat_var
+                radius = feat.get("radius", feat_props.get("radius", feat_props.get("Radius", 1.0)))
+                edges_spec = feat.get("edges", feat_props.get("edges", "all"))
+                if previous_var is None:
+                    lines.append(f"# WARNING: Cannot fillet '{feat_name}' without a previous body feature")
+                else:
+                    lines.append("doc.recompute()")
+                    lines.append(
+                        f"{feat_var} = {body_var}.newObject('PartDesign::Fillet', '{feat_name}')"
+                    )
+                    lines.append(
+                        f"{feat_var}.Base = ({previous_var}, _finishing_edges({previous_var}.Shape, {edges_spec!r}))"
+                    )
+                    lines.append(f"{feat_var}.Radius = {radius}")
+                    previous_var = feat_var
 
             else:
                 lines.append(

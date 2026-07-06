@@ -579,8 +579,14 @@ class TestBody:
         feat2 = fillet(proj, body_index=0, radius=1.0, edges=[0, 1, 2])
         assert feat2["edges"] == [0, 1, 2]
 
+        feat3 = fillet(proj, body_index=0, radius=1.0, edges="bottom_rim")
+        assert feat3["edges"] == "bottom_rim"
+
         with pytest.raises(ValueError, match="positive"):
             fillet(proj, body_index=0, radius=-1.0)
+
+        with pytest.raises(ValueError, match="Edges"):
+            fillet(proj, body_index=0, radius=1.0, edges="vertical")
 
     def test_chamfer(self):
         proj = self._project_with_sketch()
@@ -592,8 +598,58 @@ class TestBody:
         assert feat["size"] == 1.5
         assert feat["edges"] == "all"
 
+        feat2 = chamfer(proj, body_index=0, size=1.0, edges="bottom_rim")
+        assert feat2["edges"] == "bottom_rim"
+
         with pytest.raises(ValueError, match="positive"):
             chamfer(proj, body_index=0, size=0.0)
+
+    def test_macro_binds_finishing_edges(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "finishing-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "Base",
+                            "length": 10.0,
+                            "width": 8.0,
+                            "height": 6.0,
+                        },
+                        {
+                            "id": 2,
+                            "type": "chamfer",
+                            "name": "RimChamfer",
+                            "size": 1.0,
+                            "edges": "bottom_rim",
+                        },
+                        {
+                            "id": 3,
+                            "type": "fillet",
+                            "name": "AllFillet",
+                            "radius": 2.5,
+                            "edges": "all",
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "def _finishing_edges(shape, spec):" in macro
+        assert "_finishing_edges(feat_MainBody_1_additive_box.Shape, 'bottom_rim')" in macro
+        assert "_finishing_edges(feat_MainBody_2_chamfer.Shape, 'all')" in macro
+        assert ".Size = 1.0" in macro
+        assert ".Radius = 2.5" in macro
 
     def test_revolution(self):
         proj = self._project_with_sketch()

@@ -1294,14 +1294,14 @@ def body_pocket(body_index: int, sketch_index: int, length: float,
 @body_group.command("fillet")
 @click.argument("body_index", type=int)
 @click.option("--radius", "-r", default=1.0, type=float, help="Fillet radius.")
-@click.option("--edges", default="all", help="Edges: 'all' or comma-sep indices.")
+@click.option("--edges", default="all", help="Edges: named selector ('all', 'bottom_rim') or comma-sep indices.")
 @handle_error
 def body_fillet(body_index: int, radius: float, edges: str) -> None:
     """Add a fillet feature to a body."""
     sess = get_session()
     sess.snapshot(f"Fillet body #{body_index}")
     proj = sess.get_project()
-    edge_val = edges if edges == "all" else [int(x) for x in edges.split(",")]
+    edge_val = edges if edges in body_mod.EDGE_SELECTORS else [int(x) for x in edges.split(",")]
     result = body_mod.fillet(proj, body_index, radius=radius, edges=edge_val)
     output_fn(result, "Added fillet feature")
 
@@ -1309,14 +1309,14 @@ def body_fillet(body_index: int, radius: float, edges: str) -> None:
 @body_group.command("chamfer")
 @click.argument("body_index", type=int)
 @click.option("--size", "-s", default=1.0, type=float, help="Chamfer size.")
-@click.option("--edges", default="all", help="Edges: 'all' or comma-sep indices.")
+@click.option("--edges", default="all", help="Edges: named selector ('all', 'bottom_rim') or comma-sep indices.")
 @handle_error
 def body_chamfer(body_index: int, size: float, edges: str) -> None:
     """Add a chamfer feature to a body."""
     sess = get_session()
     sess.snapshot(f"Chamfer body #{body_index}")
     proj = sess.get_project()
-    edge_val = edges if edges == "all" else [int(x) for x in edges.split(",")]
+    edge_val = edges if edges in body_mod.EDGE_SELECTORS else [int(x) for x in edges.split(",")]
     result = body_mod.chamfer(proj, body_index, size=size, edges=edge_val)
     output_fn(result, "Added chamfer feature")
 
