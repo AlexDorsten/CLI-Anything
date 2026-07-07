@@ -1521,15 +1521,22 @@ def body_additive_box(body_index: int, length: float, width: float,
 @click.option("--height", "-h", default=10.0, type=float)
 @click.option("--position", default=None, help="Placement position as x,y,z.")
 @click.option("--rotation", default=None, help="Placement rotation as rx,ry,rz degrees.")
+@click.option("--rotation-axis", default=None,
+              help="Axis-angle rotation axis as ax,ay,az (rotates default +Z onto this direction).")
+@click.option("--rotation-angle", default=None, type=float,
+              help="Axis-angle rotation angle in degrees (used with --rotation-axis).")
 @handle_error
 def body_additive_cylinder(body_index: int, radius: float, height: float,
-                           position: Optional[str], rotation: Optional[str]) -> None:
+                           position: Optional[str], rotation: Optional[str],
+                           rotation_axis: Optional[str],
+                           rotation_angle: Optional[float]) -> None:
     """Add an additive cylinder primitive."""
     sess = get_session()
     sess.snapshot(f"Additive cylinder body #{body_index}")
     proj = sess.get_project()
     pos = _parse_vec3(position) if position else None
     rot = _parse_vec3(rotation) if rotation else None
+    axis = _parse_vec3(rotation_axis) if rotation_axis else None
     result = body_mod.additive_cylinder(
         proj,
         body_index,
@@ -1537,6 +1544,8 @@ def body_additive_cylinder(body_index: int, radius: float, height: float,
         height=height,
         position=pos,
         rotation=rot,
+        rotation_axis=axis,
+        rotation_angle=rotation_angle,
     )
     output_fn(result, "Added additive cylinder")
 

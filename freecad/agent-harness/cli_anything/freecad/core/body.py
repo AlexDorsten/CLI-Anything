@@ -5,6 +5,7 @@ Provides creation of PartDesign bodies and additive/subtractive features
 such as pad, pocket, fillet, chamfer, and revolution.
 """
 
+import math
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -113,16 +114,42 @@ def _validate_vec3(value: Optional[List[float]], label: str) -> Optional[List[fl
 def _normalize_feature_placement(
     position: Optional[List[float]] = None,
     rotation: Optional[List[float]] = None,
-) -> Optional[Dict[str, List[float]]]:
-    """Normalize optional position/rotation into a placement payload."""
+    rotation_axis: Optional[List[float]] = None,
+    rotation_angle: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize optional position/rotation into a placement payload.
+
+    Two rotation forms are supported:
+
+    * Euler angles (``rotation`` = ``[rx, ry, rz]`` degrees), and
+    * axis-angle (``rotation_axis`` = a 3-vector direction, ``rotation_angle``
+      = degrees), which rotates the primitive's default +Z axis onto an
+      arbitrary measured direction. Axis-angle is the natural form for an
+      oblique boss (e.g. a tube that runs at an angle to the canonical frame)
+      and is emitted as ``FreeCAD.Rotation(FreeCAD.Vector(...), angle)``.
+
+    When both forms are supplied the axis-angle form wins (it is the more
+    specific request).
+    """
     pos = _validate_vec3(position, "position")
     rot = _validate_vec3(rotation, "rotation")
-    if pos is None and rot is None:
+    axis = _validate_vec3(rotation_axis, "rotation_axis")
+    if axis is not None:
+        norm = math.sqrt(sum(component * component for component in axis))
+        if norm <= 1e-9:
+            raise ValueError("rotation_axis must be a non-zero vector")
+        axis = [component / norm for component in axis]
+    angle = float(rotation_angle) if rotation_angle is not None else None
+    if pos is None and rot is None and axis is None:
         return None
-    return {
+    payload: Dict[str, Any] = {
         "position": pos or [0.0, 0.0, 0.0],
         "rotation": rot or [0.0, 0.0, 0.0],
     }
+    if axis is not None:
+        payload["rotation_axis"] = axis
+        payload["rotation_angle"] = angle if angle is not None else 0.0
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +698,8 @@ def _additive_primitive(
     params: Dict[str, Any],
     position: Optional[List[float]] = None,
     rotation: Optional[List[float]] = None,
+    rotation_axis: Optional[List[float]] = None,
+    rotation_angle: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Internal helper to add an additive primitive feature."""
     _validate_project(project)
@@ -681,7 +710,12 @@ def _additive_primitive(
         "type": f"additive_{primitive_type}",
     }
     feature.update(params)
-    placement = _normalize_feature_placement(position=position, rotation=rotation)
+    placement = _normalize_feature_placement(
+        position=position,
+        rotation=rotation,
+        rotation_axis=rotation_axis,
+        rotation_angle=rotation_angle,
+    )
     if placement is not None:
         feature["placement"] = placement
 
@@ -739,6 +773,8 @@ def additive_cylinder(
     height: float = 10.0,
     position: Optional[List[float]] = None,
     rotation: Optional[List[float]] = None,
+    rotation_axis: Optional[List[float]] = None,
+    rotation_angle: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Add an additive cylinder primitive to a body.
 
@@ -770,6 +806,8 @@ def additive_cylinder(
         {"radius": radius, "height": height},
         position=position,
         rotation=rotation,
+        rotation_axis=rotation_axis,
+        rotation_angle=rotation_angle,
     )
 
 

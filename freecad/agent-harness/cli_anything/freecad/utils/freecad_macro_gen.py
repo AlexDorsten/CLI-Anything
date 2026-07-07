@@ -215,17 +215,29 @@ def _placement_expr(placement: Optional[Dict[str, Any]]) -> Optional[str]:
     if not placement:
         return None
     position = placement.get("position") or [0.0, 0.0, 0.0]
-    rotation = placement.get("rotation") or [0.0, 0.0, 0.0]
     x = float(position[0] if len(position) > 0 else 0.0)
     y = float(position[1] if len(position) > 1 else 0.0)
     z = float(position[2] if len(position) > 2 else 0.0)
-    rx = float(rotation[0] if len(rotation) > 0 else 0.0)
-    ry = float(rotation[1] if len(rotation) > 1 else 0.0)
-    rz = float(rotation[2] if len(rotation) > 2 else 0.0)
+    # Axis-angle form takes precedence: it rotates the primitive's default +Z
+    # axis onto an arbitrary measured direction (used for oblique bosses like a
+    # tilted tube). Falls back to the Euler [rx, ry, rz] form otherwise.
+    axis = placement.get("rotation_axis")
+    if axis:
+        ax = float(axis[0] if len(axis) > 0 else 0.0)
+        ay = float(axis[1] if len(axis) > 1 else 0.0)
+        az = float(axis[2] if len(axis) > 2 else 1.0)
+        angle = float(placement.get("rotation_angle") or 0.0)
+        rotation_expr = f"FreeCAD.Rotation(FreeCAD.Vector({ax}, {ay}, {az}), {angle})"
+    else:
+        rotation = placement.get("rotation") or [0.0, 0.0, 0.0]
+        rx = float(rotation[0] if len(rotation) > 0 else 0.0)
+        ry = float(rotation[1] if len(rotation) > 1 else 0.0)
+        rz = float(rotation[2] if len(rotation) > 2 else 0.0)
+        rotation_expr = f"FreeCAD.Rotation({rz}, {ry}, {rx})"
     return (
         "FreeCAD.Placement("
         f"FreeCAD.Vector({x}, {y}, {z}), "
-        f"FreeCAD.Rotation({rz}, {ry}, {rx}))"
+        f"{rotation_expr})"
     )
 
 

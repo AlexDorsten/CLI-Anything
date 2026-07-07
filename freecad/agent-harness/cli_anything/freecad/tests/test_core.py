@@ -900,6 +900,50 @@ class TestBody:
         assert polar["axis"] == "Z"
         assert polar["occurrences"] == 4
 
+    def test_additive_cylinder_axis_angle_placement(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        proj = _make_project()
+        create_body(proj, name="SpoutBody")
+        additive_box(proj, body_index=0, length=20.0, width=20.0, height=10.0)
+
+        spout = additive_cylinder(
+            proj,
+            body_index=0,
+            radius=0.83,
+            height=9.73,
+            position=[5.0, 4.0, 3.0],
+            rotation_axis=[0.969, -0.237, 0.066],
+            rotation_angle=86.2,
+        )
+        assert spout["type"] == "additive_cylinder"
+        placement = spout["placement"]
+        assert placement["position"] == [5.0, 4.0, 3.0]
+        # axis is normalized on the way in
+        axis = placement["rotation_axis"]
+        assert math.isclose(math.sqrt(sum(c * c for c in axis)), 1.0, rel_tol=1e-6)
+        assert math.isclose(axis[0], 0.969, abs_tol=1e-3)
+        assert placement["rotation_angle"] == 86.2
+
+        macro = generate_macro(proj, "/tmp/spout.fcstd", export_format="fcstd")
+        # the macro must tilt the cylinder via an axis-angle FreeCAD.Rotation
+        assert "FreeCAD.Rotation(FreeCAD.Vector(" in macro
+        assert "86.2)" in macro
+
+    def test_additive_cylinder_axis_angle_requires_nonzero_axis(self):
+        proj = _make_project()
+        create_body(proj, name="ZeroAxisBody")
+        additive_box(proj, body_index=0, length=10.0, width=10.0, height=10.0)
+        with pytest.raises(ValueError):
+            additive_cylinder(
+                proj,
+                body_index=0,
+                radius=1.0,
+                height=5.0,
+                rotation_axis=[0.0, 0.0, 0.0],
+                rotation_angle=30.0,
+            )
+
     def test_subtractive_primitive_placement(self):
         proj = _make_project()
         create_body(proj, name="CutBody")
