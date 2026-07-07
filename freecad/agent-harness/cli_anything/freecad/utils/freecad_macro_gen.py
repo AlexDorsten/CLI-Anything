@@ -555,11 +555,32 @@ def _gen_bodies(project: dict) -> List[str]:
                 previous_var = feat_var
 
             elif feat_type == "pocket":
-                length = feat_props.get("length", feat_props.get("Length", 5.0))
+                length = feat.get("length", feat_props.get("length", feat_props.get("Length", 5.0)))
+                profile_var = None
+                sketch = _profile_sketch(project, feat)
+                if sketch is not None:
+                    candidate_var = f"sketch_{body_name}_{feature_counter}"
+                    if _emit_profile_sketch(lines, body_var, sketch, candidate_var):
+                        profile_var = candidate_var
+                    else:
+                        lines.append(
+                            f"# WARNING: Pocket '{feat_name}' references sketch without supported geometry"
+                        )
+                elif feat.get("sketch_index") is not None:
+                    lines.append(
+                        f"# WARNING: Pocket '{feat_name}' references unknown sketch index {feat.get('sketch_index')!r}"
+                    )
                 lines.append(
                     f"{feat_var} = {body_var}.newObject('PartDesign::Pocket', '{feat_name}')"
                 )
-                lines.append(f"{feat_var}.Length = {length}")
+                if profile_var is not None:
+                    lines.append(f"{feat_var}.Profile = {profile_var}")
+                    lines.append(f"{profile_var}.Visibility = False")
+                lines.append(f"{feat_var}.Length = {float(length)}")
+                if feat.get("reversed"):
+                    lines.append(f"{feat_var}.Reversed = True")
+                if feat.get("symmetric"):
+                    lines.append(f"{feat_var}.Midplane = True")
                 previous_var = feat_var
 
             elif feat_type == "revolution":

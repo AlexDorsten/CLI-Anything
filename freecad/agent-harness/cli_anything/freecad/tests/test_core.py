@@ -727,6 +727,105 @@ class TestBody:
         assert ".Profile =" not in macro
         assert ".Length = 5.0" in macro
 
+    def test_macro_binds_pocket_profile_sketch(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "pocket-profile-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "sketches": [
+                {
+                    "id": 1,
+                    "name": "BaseOutline",
+                    "plane": "XY",
+                    "offset": 0.0,
+                    "elements": [
+                        {"id": 1, "type": "line", "start": [0.0, 0.0], "end": [30.0, 0.0]},
+                        {"id": 2, "type": "line", "start": [30.0, 0.0], "end": [30.0, 10.0]},
+                        {"id": 3, "type": "line", "start": [30.0, 10.0], "end": [0.0, 10.0]},
+                        {"id": 4, "type": "line", "start": [0.0, 10.0], "end": [0.0, 0.0]},
+                    ],
+                    "constraints": [],
+                    "closed": True,
+                },
+                {
+                    "id": 2,
+                    "name": "CavityOutline",
+                    "plane": "XY",
+                    "offset": 8.0,
+                    "elements": [
+                        {"id": 1, "type": "line", "start": [2.0, 2.0], "end": [28.0, 2.0]},
+                        {"id": 2, "type": "line", "start": [28.0, 2.0], "end": [28.0, 8.0]},
+                        {"id": 3, "type": "line", "start": [28.0, 8.0], "end": [2.0, 8.0]},
+                        {"id": 4, "type": "line", "start": [2.0, 8.0], "end": [2.0, 2.0]},
+                    ],
+                    "constraints": [],
+                    "closed": True,
+                },
+            ],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "pad",
+                            "sketch_index": 0,
+                            "sketch_name": "BaseOutline",
+                            "length": 8.0,
+                            "symmetric": False,
+                            "reversed": False,
+                        },
+                        {
+                            "id": 2,
+                            "type": "pocket",
+                            "sketch_index": 1,
+                            "sketch_name": "CavityOutline",
+                            "length": 7.0,
+                            "symmetric": False,
+                            "reversed": False,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "newObject('Sketcher::SketchObject', 'CavityOutline')" in macro
+        # the cavity sketch is lifted onto its plane offset along the normal
+        assert "FreeCAD.Vector(0.0, 0.0, 8.0)" in macro
+        assert ".Profile = sketch_MainBody_2" in macro
+        assert "sketch_MainBody_2.Visibility = False" in macro
+        assert ".Length = 7.0" in macro
+
+    def test_macro_pocket_without_resolvable_sketch_keeps_previous_behavior(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "pocket-orphan-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "sketches": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {"id": 1, "type": "pocket", "sketch_index": 3, "length": 5.0}
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "WARNING: Pocket" in macro
+        assert ".Profile =" not in macro
+        assert ".Length = 5.0" in macro
+
     def test_revolution(self):
         proj = self._project_with_sketch()
         create_body(proj)
