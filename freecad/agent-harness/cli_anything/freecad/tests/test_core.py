@@ -651,6 +651,51 @@ class TestBody:
         assert ".Size = 1.0" in macro
         assert ".Radius = 2.5" in macro
 
+    def test_top_rim_selector_accepted_and_bound(self):
+        # top_rim is a valid semantic selector (mirror of bottom_rim at ZMax);
+        # a padded oval outline exposes its whole face perimeter as one wire,
+        # so the macro's _finishing_edges falls back to every in-plane edge.
+        proj = self._project_with_sketch()
+        create_body(proj)
+        pad(proj, body_index=0, sketch_index=0, length=10.0)
+        feat = fillet(proj, body_index=0, radius=1.4, edges="top_rim")
+        assert feat["edges"] == "top_rim"
+
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "top-rim-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "Base",
+                            "length": 10.0,
+                            "width": 8.0,
+                            "height": 6.0,
+                        },
+                        {
+                            "id": 2,
+                            "type": "fillet",
+                            "name": "TopRimFillet",
+                            "radius": 1.4,
+                            "edges": "top_rim",
+                        },
+                    ],
+                }
+            ],
+        }
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+        assert "_finishing_edges(feat_MainBody_1_additive_box.Shape, 'top_rim')" in macro
+        assert "spec in ('bottom_rim', 'top_rim')" in macro
+        assert "plane_z = bound_box.ZMin if spec == 'bottom_rim' else bound_box.ZMax" in macro
+
     def test_macro_binds_pad_profile_sketch(self):
         from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
 
