@@ -743,6 +743,48 @@ class TestFreeCADBackend:
               f"(none={volumes['none']:.1f}, global={volumes['global']:.1f}, "
               f"local={volumes['local']:.1f})")
 
+    def test_circumferential_sector_cuts_off_origin_neck(self, tmp_path):
+        """Regression for the FreeCAD-STL-Importer s18 case: the sector tool's
+        placement rotated the sector about (cx, cy) but then translated it by
+        (cx, cy) again, doubling the offset. Any neck whose axis sits away
+        from the document origin lost its circumferential groove cut almost
+        entirely; a neck centered at the origin never exposed the bug.
+        """
+
+        def neck_project(name: str, with_groove: bool) -> dict:
+            proj = create_document(name=name)
+            create_body(proj)
+            additive_cylinder(proj, body_index=0, radius=6.236, height=7.87,
+                              position=[7.2, 7.15, 8.17])
+            if with_groove:
+                segments = [
+                    {"kind": "circumferential", "angle0": 69.0, "angle1": 157.0,
+                     "z0": 8.9, "z1": 10.4, "wall_radius": 6.23, "depth": 0.95},
+                ]
+                bayonet_groove(proj, body_index=0, segments=segments,
+                               wall_radius=6.256, depth=0.9,
+                               center_x=7.2, center_y=7.15, symmetry=1)
+            return proj
+
+        volumes = {}
+        for label, with_groove in (("none", False), ("groove", True)):
+            proj = neck_project(f"OffOriginNeck_{label}", with_groove)
+            output = str(tmp_path / f"neck_{label}.stl")
+            export_project(proj, output, preset="stl")
+            volumes[label] = _stl_mesh_volume(output)
+
+        # analytical expectation: an 88 deg ring sector between the local
+        # wall (5.28) and the segment's wall_radius (6.23), 1.5 mm tall,
+        # plus a small overcut sliver out to 6.236 -> ~10 mm^3
+        removed = volumes["none"] - volumes["groove"]
+        assert 8.0 < removed < 14.0, (
+            f"expected the circumferential sector to remove ~10 mm^3 from "
+            f"the off-origin neck, got {removed:.2f} mm^3 "
+            f"(volumes: {volumes})"
+        )
+        print(f"\n  off-origin sector bite: {removed:.2f} mm^3 "
+              f"(none={volumes['none']:.1f}, groove={volumes['groove']:.1f})")
+
     @pytest.mark.skipif(not _has_freecad_preview(), reason="GUI-capable FreeCAD not installed")
     def test_preview_capture_bundle(self, tmp_path):
         proj = create_document(name="PreviewPart")
