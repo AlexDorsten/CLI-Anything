@@ -557,6 +557,21 @@ def _gen_bodies(project: dict) -> List[str]:
     # (raw Part.makeLoft shapes cannot be spliced into a live PartDesign tip
     # mid-tree, same constraint as the bayonet swept cuts above).
     section_lofts: List[tuple[str, str, Dict[str, Any]]] = []
+    # Collect (body_var, loft_feature) for the subtractive twin of
+    # additive_section_loft: same measured polygon-stack loft, but realised
+    # doc-level as a Part::Cut instead of a Part::Fuse (see the emission
+    # loop below for the doc-level ordering against section_lofts/bayonet).
+    subtractive_section_lofts: List[tuple[str, str, Dict[str, Any]]] = []
+    # additive_section_loft / subtractive_section_loft features carrying
+    # after_cuts=True (e.g. a "cut-then-restore" island like a socket tube
+    # rebuilt inside a cavity that is itself now cut doc-level, instead of
+    # in-tree before the island used to be added): these must be realised
+    # AFTER the normal fuse/cut phases below, chained onto whatever the
+    # body's result is at that point -- otherwise the island would be added
+    # to the not-yet-hollowed body and then erased wholesale by the cavity
+    # cut that runs afterward.
+    deferred_section_lofts: List[tuple[str, str, Dict[str, Any]]] = []
+    deferred_subtractive_lofts: List[tuple[str, str, Dict[str, Any]]] = []
 
     for body in bodies:
         body_name = _safe_name(body.get("name", "Body"))
@@ -792,8 +807,23 @@ def _gen_bodies(project: dict) -> List[str]:
                 # Measured multi-section point loft. Recorded here and
                 # realised as a doc-level Part::Fuse once the body has been
                 # recomputed (raw Part.makeLoft shapes cannot be spliced into
-                # a live PartDesign tip mid-tree).
-                section_lofts.append((body_var, feat_name, feat))
+                # a live PartDesign tip mid-tree). after_cuts defers it to
+                # run after the normal fuse/cut phases (see collection above).
+                if feat.get("after_cuts"):
+                    deferred_section_lofts.append((body_var, feat_name, feat))
+                else:
+                    section_lofts.append((body_var, feat_name, feat))
+
+            elif feat_type == "subtractive_section_loft":
+                # Subtractive twin of additive_section_loft: the same measured
+                # polygon-stack loft, but recorded here and realised as a
+                # doc-level Part::Cut (removing material) once the body has
+                # been recomputed, chained after any additive fusion on the
+                # same body (see the emission loop below).
+                if feat.get("after_cuts"):
+                    deferred_subtractive_lofts.append((body_var, feat_name, feat))
+                else:
+                    subtractive_section_lofts.append((body_var, feat_name, feat))
 
             else:
                 lines.append(
@@ -803,9 +833,87 @@ def _gen_bodies(project: dict) -> List[str]:
 
             lines.append("")
 
-    if bayonet_cuts or section_lofts:
+    if (
+        bayonet_cuts
+        or section_lofts
+        or subtractive_section_lofts
+        or deferred_section_lofts
+        or deferred_subtractive_lofts
+    ):
         lines.append("doc.recompute()")
         lines.append("")
+
+    # Track the current top-level result per body across these doc-level
+    # ops. additive_section_loft fusions are emitted first (below), then all
+    # cuts (bayonet grooves and subtractive_section_loft) chain sequentially
+    # onto whatever that body's current result is -- not always the raw
+    # body_var. Without this, a body carrying both an additive fusion and a
+    # cut would have each op independently Base'd on the raw body, leaving
+    # two disconnected top-level shapes instead of one combined final part
+    # (the cut result would silently ignore the fused-in material and vice
+    # versa).
+    body_current: Dict[str, str] = {}
+
+    def _current_var(body_var: str) -> str:
+        return body_current.get(body_var, body_var)
+
+    for loft_index, (body_var, feat_name, feat) in enumerate(section_lofts, start=1):
+        sections = feat.get("sections", [])
+        ruled = bool(feat.get("ruled", True))
+        redrill_holes = feat.get("redrill_holes") or []
+        safe_feat_name = _safe_name(feat_name)
+
+        loft_var = f"section_loft_{loft_index}"
+        lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
+        lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
+        lines.append(f"{loft_var}.Shape = {loft_var}_shape")
+        lines.append(f"{loft_var}.Visibility = False")
+
+        fuse_var = f"obj_{safe_feat_name}"
+        lines.append(f"{fuse_var} = doc.addObject('Part::Fuse', '{safe_feat_name}')")
+        lines.append(f"{fuse_var}.Base = {_current_var(body_var)}")
+        lines.append(f"{fuse_var}.Tool = {loft_var}")
+        lines.append("")
+        body_current[body_var] = fuse_var
+
+        if redrill_holes:
+            # A plain Part::Fuse has no notion of holes already cut into the
+            # body below the loft's Z band: wherever the (hole-less) loft
+            # solid overlaps a hole's XY footprint, the union silently
+            # refills it. Re-cut each affected hole doc-level, after the
+            # fuse, with a plain cylinder spanning its full original depth.
+            redrill_var = f"redrill_{loft_index}"
+            lines.append(f"{redrill_var}_pieces = []")
+            for hole in redrill_holes:
+                cx = float(hole["cx"])
+                cy = float(hole["cy"])
+                radius = float(hole["radius"])
+                z0 = float(hole.get("z0", 0.0))
+                z1 = float(hole["z1"])
+                height = z1 - z0
+                lines.append(
+                    f"{redrill_var}_pieces.append(Part.makeCylinder("
+                    f"{radius}, {height}, FreeCAD.Vector({cx}, {cy}, {z0}), "
+                    f"FreeCAD.Vector(0, 0, 1)))"
+                )
+            lines.append(f"{redrill_var}_shape = {redrill_var}_pieces[0]")
+            lines.append(f"for _extra in {redrill_var}_pieces[1:]:")
+            lines.append(f"    {redrill_var}_shape = {redrill_var}_shape.fuse(_extra)")
+            lines.append(
+                f"{redrill_var}_tool = doc.addObject('Part::Feature', "
+                f"'{safe_feat_name}_redrill_tool')"
+            )
+            lines.append(f"{redrill_var}_tool.Shape = {redrill_var}_shape")
+            lines.append(f"{redrill_var}_tool.Visibility = False")
+            recut_var = f"{fuse_var}_redrilled"
+            lines.append(
+                f"{recut_var} = doc.addObject('Part::Cut', '{safe_feat_name}_redrilled')"
+            )
+            lines.append(f"{recut_var}.Base = {fuse_var}")
+            lines.append(f"{recut_var}.Tool = {redrill_var}_tool")
+            lines.append("")
+            body_current[body_var] = recut_var
+
     for cut_index, (body_var, feat_name, feat) in enumerate(bayonet_cuts, start=1):
         props = feat.get("properties", {})
 
@@ -863,17 +971,40 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"    {tool_var}.Visibility = False")
         cut_var = f"obj_{_safe_name(feat_name)}"
         lines.append(f"    {cut_var} = doc.addObject('Part::Cut', '{_safe_name(feat_name)}')")
-        lines.append(f"    {cut_var}.Base = {body_var}")
+        lines.append(f"    {cut_var}.Base = {_current_var(body_var)}")
         lines.append(f"    {cut_var}.Tool = {tool_var}")
         lines.append("")
+        body_current[body_var] = cut_var
 
-    for loft_index, (body_var, feat_name, feat) in enumerate(section_lofts, start=1):
+    for loft_index, (body_var, feat_name, feat) in enumerate(subtractive_section_lofts, start=1):
         sections = feat.get("sections", [])
         ruled = bool(feat.get("ruled", True))
-        redrill_holes = feat.get("redrill_holes") or []
         safe_feat_name = _safe_name(feat_name)
 
-        loft_var = f"section_loft_{loft_index}"
+        loft_var = f"subtractive_section_loft_{loft_index}"
+        lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
+        lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
+        lines.append(f"{loft_var}.Shape = {loft_var}_shape")
+        lines.append(f"{loft_var}.Visibility = False")
+
+        cut_var = f"obj_{safe_feat_name}"
+        lines.append(f"{cut_var} = doc.addObject('Part::Cut', '{safe_feat_name}')")
+        lines.append(f"{cut_var}.Base = {_current_var(body_var)}")
+        lines.append(f"{cut_var}.Tool = {loft_var}")
+        lines.append("")
+        body_current[body_var] = cut_var
+
+    # after_cuts phase: islands that must be added back (and, for a bore,
+    # re-drilled) AFTER the cavity cuts above have already run -- e.g. a
+    # socket tube rebuilt inside a chamber that is itself cut doc-level now,
+    # instead of in-tree before the socket used to be added. Fuses first,
+    # then cuts, exactly mirroring the normal phases, just later in time.
+    for loft_index, (body_var, feat_name, feat) in enumerate(deferred_section_lofts, start=1):
+        sections = feat.get("sections", [])
+        ruled = bool(feat.get("ruled", True))
+        safe_feat_name = _safe_name(feat_name)
+
+        loft_var = f"post_cut_section_loft_{loft_index}"
         lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
         lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
         lines.append(f"{loft_var}.Shape = {loft_var}_shape")
@@ -881,46 +1012,28 @@ def _gen_bodies(project: dict) -> List[str]:
 
         fuse_var = f"obj_{safe_feat_name}"
         lines.append(f"{fuse_var} = doc.addObject('Part::Fuse', '{safe_feat_name}')")
-        lines.append(f"{fuse_var}.Base = {body_var}")
+        lines.append(f"{fuse_var}.Base = {_current_var(body_var)}")
         lines.append(f"{fuse_var}.Tool = {loft_var}")
         lines.append("")
+        body_current[body_var] = fuse_var
 
-        if redrill_holes:
-            # A plain Part::Fuse has no notion of holes already cut into the
-            # body below the loft's Z band: wherever the (hole-less) loft
-            # solid overlaps a hole's XY footprint, the union silently
-            # refills it. Re-cut each affected hole doc-level, after the
-            # fuse, with a plain cylinder spanning its full original depth.
-            redrill_var = f"redrill_{loft_index}"
-            lines.append(f"{redrill_var}_pieces = []")
-            for hole in redrill_holes:
-                cx = float(hole["cx"])
-                cy = float(hole["cy"])
-                radius = float(hole["radius"])
-                z0 = float(hole.get("z0", 0.0))
-                z1 = float(hole["z1"])
-                height = z1 - z0
-                lines.append(
-                    f"{redrill_var}_pieces.append(Part.makeCylinder("
-                    f"{radius}, {height}, FreeCAD.Vector({cx}, {cy}, {z0}), "
-                    f"FreeCAD.Vector(0, 0, 1)))"
-                )
-            lines.append(f"{redrill_var}_shape = {redrill_var}_pieces[0]")
-            lines.append(f"for _extra in {redrill_var}_pieces[1:]:")
-            lines.append(f"    {redrill_var}_shape = {redrill_var}_shape.fuse(_extra)")
-            lines.append(
-                f"{redrill_var}_tool = doc.addObject('Part::Feature', "
-                f"'{safe_feat_name}_redrill_tool')"
-            )
-            lines.append(f"{redrill_var}_tool.Shape = {redrill_var}_shape")
-            lines.append(f"{redrill_var}_tool.Visibility = False")
-            recut_var = f"{fuse_var}_redrilled"
-            lines.append(
-                f"{recut_var} = doc.addObject('Part::Cut', '{safe_feat_name}_redrilled')"
-            )
-            lines.append(f"{recut_var}.Base = {fuse_var}")
-            lines.append(f"{recut_var}.Tool = {redrill_var}_tool")
-            lines.append("")
+    for loft_index, (body_var, feat_name, feat) in enumerate(deferred_subtractive_lofts, start=1):
+        sections = feat.get("sections", [])
+        ruled = bool(feat.get("ruled", True))
+        safe_feat_name = _safe_name(feat_name)
+
+        loft_var = f"post_cut_subtractive_loft_{loft_index}"
+        lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
+        lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
+        lines.append(f"{loft_var}.Shape = {loft_var}_shape")
+        lines.append(f"{loft_var}.Visibility = False")
+
+        cut_var = f"obj_{safe_feat_name}"
+        lines.append(f"{cut_var} = doc.addObject('Part::Cut', '{safe_feat_name}')")
+        lines.append(f"{cut_var}.Base = {_current_var(body_var)}")
+        lines.append(f"{cut_var}.Tool = {loft_var}")
+        lines.append("")
+        body_current[body_var] = cut_var
 
     return lines
 

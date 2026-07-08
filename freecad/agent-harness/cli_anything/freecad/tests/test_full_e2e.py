@@ -59,6 +59,7 @@ from cli_anything.freecad.core.body import (
     additive_cone,
     additive_cylinder,
     additive_section_loft,
+    subtractive_section_loft,
     bayonet_groove,
     create_body,
     pad,
@@ -926,6 +927,156 @@ class TestFreeCADBackend:
                 proj, body_index=0,
                 sections=[{"z": 2.0, "points": good}, {"z": 4.0, "points": good}],
             )
+
+    def test_subtractive_section_loft_matches_frustum_stack_off_origin(self, tmp_path):
+        """Regression for the FreeCAD-STL-Importer volume campaign iteration
+        3 (cutting the adapter's main cavity from measured inner-contour
+        bands): the subtractive twin of additive_section_loft must remove
+        the expected frustum-stack volume from a block, as a doc-level
+        Part::Cut, even off-origin. A 10x10x10 block is cut with a 3-level
+        loft (10x10 -> 8x8 -> 10x10 squares spanning z=2..6), i.e. the same
+        two square frustums as the additive test above; the removed volume
+        is the block volume minus the cut result's volume.
+        """
+        cx, cy = 7.0, 5.0
+
+        def build(name: str, with_cut: bool) -> dict:
+            proj = create_document(name=name)
+            create_body(proj)
+            additive_box(proj, body_index=0, length=10.0, width=10.0, height=10.0,
+                        position=[cx - 5.0, cy - 5.0, 0.0])
+            if with_cut:
+                sections = [
+                    {"z": 2.0, "points": self._square_loft_points(cx, cy, 5.0)},
+                    {"z": 4.0, "points": self._square_loft_points(cx, cy, 4.0)},
+                    {"z": 6.0, "points": self._square_loft_points(cx, cy, 5.0)},
+                ]
+                subtractive_section_loft(proj, body_index=0, sections=sections, ruled=True)
+            return proj
+
+        volumes = {}
+        for label, with_cut in (("block_only", False), ("with_cut", True)):
+            proj = build(f"SubSectionLoft_{label}", with_cut)
+            output = str(tmp_path / f"subloft_{label}.stl")
+            export_project(proj, output, preset="stl")
+            volumes[label] = _stl_mesh_volume(output)
+
+        block_volume = 10.0 * 10.0 * 10.0
+        assert abs(volumes["block_only"] - block_volume) < 0.05 * block_volume, (
+            f"sanity check: block alone should be ~{block_volume:.1f} mm^3, "
+            f"got {volumes['block_only']:.1f} mm^3"
+        )
+
+        seg1 = 2.0 * (10.0 ** 2 + 10.0 * 8.0 + 8.0 ** 2) / 3.0
+        seg2 = 2.0 * (8.0 ** 2 + 8.0 * 10.0 + 10.0 ** 2) / 3.0
+        expected_removed = seg1 + seg2
+        removed = volumes["block_only"] - volumes["with_cut"]
+
+        assert abs(removed - expected_removed) < 0.15 * expected_removed, (
+            f"expected ~{expected_removed:.1f} mm^3 removed (frustum stack), "
+            f"got {removed:.1f} mm^3 (block={volumes['block_only']:.1f}, "
+            f"cut={volumes['with_cut']:.1f})"
+        )
+        print(f"\n  subtractive section loft removed volume: {removed:.2f} mm^3 "
+              f"(expected ~{expected_removed:.2f} mm^3)")
+
+    def test_subtractive_section_loft_rejects_mismatched_point_counts(self):
+        """Same fail-fast contract as additive_section_loft: sections that
+        don't all share the same point count must raise ValueError rather
+        than silently building a twisted or self-intersecting OCCT loft."""
+        proj = create_document(name="SubLoftValidation")
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10.0, width=10.0, height=10.0)
+
+        good = self._square_loft_points(0.0, 0.0, 5.0)
+        short = good[:-1]
+        with pytest.raises(ValueError):
+            subtractive_section_loft(
+                proj, body_index=0,
+                sections=[
+                    {"z": 2.0, "points": good},
+                    {"z": 4.0, "points": short},
+                    {"z": 6.0, "points": good},
+                ],
+            )
+        # fewer than 3 sections is also rejected
+        with pytest.raises(ValueError):
+            subtractive_section_loft(
+                proj, body_index=0,
+                sections=[{"z": 2.0, "points": good}, {"z": 4.0, "points": good}],
+            )
+
+    def test_after_cuts_restores_an_island_erased_by_the_cavity_cut(self, tmp_path):
+        """Regression for the FreeCAD-STL-Importer volume campaign iteration
+        3 cut-then-restore fix: an island rebuilt inside a main cavity that
+        is itself cut doc-level (subtractive_section_loft) must be added
+        back with after_cuts=True, or the cavity cut erases it wholesale
+        (this is exactly what happened on the real adapter case: vol_err
+        got WORSE, not better, until this fix landed -- the socket-ring
+        island was silently erased by the post-body cavity cut).
+
+        A 10x10x10 block gets a square cavity cut (5x5 cross-section,
+        z=2..8), then a round island (radius 2, height 2, centered in the
+        cavity, fully inside its footprint) is added. Without after_cuts,
+        the island is fused onto the body BEFORE the cavity is cut and gets
+        erased along with the surrounding material; with after_cuts, it is
+        fused AFTER the cavity cut and survives intact.
+        """
+        def ring_points(radius: float, cx: float = 5.0, cy: float = 5.0, segments: int = 32):
+            return [
+                [cx + radius * math.cos(2.0 * math.pi * i / segments),
+                 cy + radius * math.sin(2.0 * math.pi * i / segments)]
+                for i in range(segments)
+            ]
+
+        def build(name: str, after_cuts: bool) -> dict:
+            proj = create_document(name=name)
+            create_body(proj)
+            additive_box(proj, body_index=0, length=10.0, width=10.0, height=10.0)
+            square = self._square_loft_points(5.0, 5.0, 2.5)
+            subtractive_section_loft(
+                proj, body_index=0,
+                sections=[
+                    {"z": 2.0, "points": square},
+                    {"z": 5.0, "points": square},
+                    {"z": 8.0, "points": square},
+                ],
+                ruled=True,
+            )
+            additive_section_loft(
+                proj, body_index=0,
+                sections=[
+                    {"z": 3.0, "points": ring_points(2.0)},
+                    {"z": 4.0, "points": ring_points(2.0)},
+                    {"z": 5.0, "points": ring_points(2.0)},
+                ],
+                ruled=True,
+                after_cuts=after_cuts,
+            )
+            return proj
+
+        volumes = {}
+        for label, after_cuts in (("without_after_cuts", False), ("with_after_cuts", True)):
+            proj = build(f"AfterCuts_{label}", after_cuts)
+            output = str(tmp_path / f"after_cuts_{label}.stl")
+            export_project(proj, output, preset="stl")
+            volumes[label] = _stl_mesh_volume(output)
+
+        # the island's volume (radius 2, height 2) is what after_cuts is
+        # supposed to preserve
+        island_volume = math.pi * (2.0 ** 2) * 2.0
+        difference = volumes["with_after_cuts"] - volumes["without_after_cuts"]
+        assert difference > 0.5 * island_volume, (
+            f"expected after_cuts to preserve ~{island_volume:.1f} mm^3 of island "
+            f"material that the plain (non-deferred) build erases; got "
+            f"without={volumes['without_after_cuts']:.1f}, "
+            f"with={volumes['with_after_cuts']:.1f}, diff={difference:.1f}"
+        )
+        print(
+            f"\n  after_cuts preserved {difference:.2f} mm^3 "
+            f"(island volume ~{island_volume:.2f} mm^3); "
+            f"without={volumes['without_after_cuts']:.2f}, with={volumes['with_after_cuts']:.2f}"
+        )
 
     @pytest.mark.skipif(not _has_freecad_preview(), reason="GUI-capable FreeCAD not installed")
     def test_preview_capture_bundle(self, tmp_path):

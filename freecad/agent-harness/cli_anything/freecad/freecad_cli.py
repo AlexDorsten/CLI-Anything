@@ -1528,9 +1528,13 @@ def body_bayonet_groove(body_index: int, segments_json: str, wall_radius: float,
               help="JSON list of {cx, cy, radius, z0, z1} holes to re-cut "
                    "doc-level after the loft fuse (holes whose Z range "
                    "overlaps the loft band would otherwise be refilled).")
+@click.option("--after-cuts", is_flag=True, default=False,
+              help="Defer this fuse until after every normal-phase cut has "
+                   "run (e.g. restoring a socket tube inside a cavity that "
+                   "is itself cut doc-level, so it is not erased by that cut).")
 @handle_error
 def body_additive_section_loft(body_index: int, sections_json: str, ruled: bool,
-                                redrill_holes_json: Optional[str]) -> None:
+                                redrill_holes_json: Optional[str], after_cuts: bool) -> None:
     """Add a measured multi-section point loft, fused onto the body."""
     sections = json.loads(sections_json)
     redrill_holes = json.loads(redrill_holes_json) if redrill_holes_json else None
@@ -1539,9 +1543,34 @@ def body_additive_section_loft(body_index: int, sections_json: str, ruled: bool,
     proj = sess.get_project()
     result = body_mod.additive_section_loft(
         proj, body_index, sections=sections, ruled=ruled,
-        redrill_holes=redrill_holes,
+        redrill_holes=redrill_holes, after_cuts=after_cuts,
     )
     output_fn(result, "Added additive section loft")
+
+
+@body_group.command("subtractive-section-loft")
+@click.argument("body_index", type=int)
+@click.option("--sections-json", required=True,
+              help="JSON list of {z, points} closed-polygon cross-sections "
+                   "(>=3 sections, each with >=8 points, equal point counts).")
+@click.option("--ruled/--no-ruled", default=True,
+              help="Straight ruled surfaces (default) vs. a smooth spline loft.")
+@click.option("--after-cuts", is_flag=True, default=False,
+              help="Defer this cut until after every normal-phase cut (and "
+                   "any after-cuts fuse) has already run.")
+@handle_error
+def body_subtractive_section_loft(body_index: int, sections_json: str, ruled: bool,
+                                   after_cuts: bool) -> None:
+    """Add a measured multi-section point loft, cut from the body (twin of
+    additive-section-loft, but subtractive: Part::Cut instead of Part::Fuse)."""
+    sections = json.loads(sections_json)
+    sess = get_session()
+    sess.snapshot(f"Subtractive section loft body #{body_index}")
+    proj = sess.get_project()
+    result = body_mod.subtractive_section_loft(
+        proj, body_index, sections=sections, ruled=ruled, after_cuts=after_cuts,
+    )
+    output_fn(result, "Added subtractive section loft")
 
 
 # -- Body: Additive primitives --
@@ -4911,7 +4940,7 @@ def repl(project_path: Optional[str]) -> None:
         "document": "new|open|save|info|profiles",
         "part": "add|remove|list|get|transform|boolean|copy|mirror|scale|offset|thickness|compound|explode|fillet-3d|chamfer-3d|loft|sweep|revolve|extrude|section|slice|line-3d|wire|polygon-3d|info|bounds|align",
         "sketch": "new|add-line|add-circle|add-rect|add-arc|constrain|close|list|get|add-point|add-ellipse|add-polygon|add-bspline|add-slot|edit-element|remove-element|remove-constraint|edit-constraint|mirror|offset|trim|extend|validate|solve-status|set-construction|project-external|intersection|add-external-face",
-        "body": "new|pad|pocket|fillet|chamfer|revolution|list|get|groove|additive-loft|additive-pipe|additive-helix|subtractive-loft|subtractive-pipe|subtractive-helix|additive-box|additive-cylinder|additive-sphere|additive-cone|additive-torus|additive-wedge|subtractive-box|subtractive-cylinder|subtractive-sphere|subtractive-cone|subtractive-torus|subtractive-wedge|draft-feature|thickness-feature|hole|linear-pattern|polar-pattern|mirrored|multi-transform|datum-plane|datum-line|datum-point|shape-binder|local-coordinate-system|toggle-freeze",
+        "body": "new|pad|pocket|fillet|chamfer|revolution|list|get|groove|additive-loft|additive-pipe|additive-helix|additive-section-loft|subtractive-section-loft|subtractive-loft|subtractive-pipe|subtractive-helix|additive-box|additive-cylinder|additive-sphere|additive-cone|additive-torus|additive-wedge|subtractive-box|subtractive-cylinder|subtractive-sphere|subtractive-cone|subtractive-torus|subtractive-wedge|draft-feature|thickness-feature|hole|linear-pattern|polar-pattern|mirrored|multi-transform|datum-plane|datum-line|datum-point|shape-binder|local-coordinate-system|toggle-freeze",
         "material": "create|assign|list|get|set|presets|import-material|export-material",
         "export": "render|info|presets",
         "preview": "recipes|capture|latest|live",

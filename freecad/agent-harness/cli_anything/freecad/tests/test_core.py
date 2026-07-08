@@ -64,6 +64,7 @@ from cli_anything.freecad.core.body import (
     polar_pattern,
     revolution,
     subtractive_box,
+    subtractive_section_loft,
     toggle_freeze,
 )
 from cli_anything.freecad.core.materials import (
@@ -864,6 +865,231 @@ class TestBody:
         assert "Part.makeCylinder(0.5, 3.0, FreeCAD.Vector(2.5, 2.5, 0.0)" in macro
         assert "doc.addObject('Part::Cut', 'Lid_redrilled')" in macro
         assert "obj_Lid_redrilled.Base = obj_Lid" in macro
+
+    def test_subtractive_section_loft_feature_recorded(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10, width=10, height=5)
+        sections = [
+            self._square_section(z=5.0, half=5.0 + i)
+            for i, z in enumerate([5.0, 7.5, 10.0])
+        ]
+        feat = subtractive_section_loft(proj, body_index=0, sections=sections, ruled=True)
+        assert feat["type"] == "subtractive_section_loft"
+        assert len(feat["sections"]) == 3
+        assert feat["ruled"] is True
+        assert "redrill_holes" not in feat
+        assert "after_cuts" not in feat
+
+    def test_section_loft_after_cuts_flag_is_recorded_only_when_set(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10, width=10, height=5)
+        sections = [
+            self._square_section(z=5.0, half=5.0 + i)
+            for i, z in enumerate([5.0, 7.5, 10.0])
+        ]
+        additive_default = additive_section_loft(proj, body_index=0, sections=sections)
+        assert "after_cuts" not in additive_default
+        additive_deferred = additive_section_loft(proj, body_index=0, sections=sections, after_cuts=True)
+        assert additive_deferred["after_cuts"] is True
+
+        subtractive_default = subtractive_section_loft(proj, body_index=0, sections=sections)
+        assert "after_cuts" not in subtractive_default
+        subtractive_deferred = subtractive_section_loft(
+            proj, body_index=0, sections=sections, after_cuts=True
+        )
+        assert subtractive_deferred["after_cuts"] is True
+
+    def test_subtractive_section_loft_validation(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10, width=10, height=5)
+        # too few sections
+        with pytest.raises(ValueError):
+            subtractive_section_loft(
+                proj, body_index=0,
+                sections=[self._square_section(5.0, 5.0), self._square_section(7.5, 5.0)],
+            )
+        # mismatched point counts across sections
+        sec_a = self._square_section(5.0, 5.0)
+        sec_b = self._square_section(7.5, 5.0)
+        sec_b["points"] = sec_b["points"][:-1]
+        sec_c = self._square_section(10.0, 5.0)
+        with pytest.raises(ValueError):
+            subtractive_section_loft(proj, body_index=0, sections=[sec_a, sec_b, sec_c])
+
+    def test_macro_binds_subtractive_section_loft_cut(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "sub-loft-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "BasePlate",
+                            "length": 10.0, "width": 10.0, "height": 10.0,
+                        },
+                        {
+                            "id": 2,
+                            "type": "subtractive_section_loft",
+                            "name": "Cavity",
+                            "ruled": True,
+                            "sections": [
+                                {"z": 2.0, "points": [[1, 1], [4, 1], [4, 4], [1, 4]]},
+                                {"z": 4.0, "points": [[2, 2], [3, 2], [3, 3], [2, 3]]},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "def _section_loft_solid(" in macro
+        assert "subtractive_section_loft_1_shape = _section_loft_solid(" in macro
+        assert "doc.addObject('Part::Cut', 'Cavity')" in macro
+        assert "obj_Cavity.Base = body_MainBody" in macro
+        assert "obj_Cavity.Tool = subtractive_section_loft_1" in macro
+
+    def test_macro_chains_subtractive_cut_after_additive_fusion_on_same_body(self):
+        """Regression for the volume campaign iteration 3 doc-level ordering
+        fix: a body carrying BOTH an additive_section_loft and a
+        subtractive_section_loft must chain the cut onto the fused result,
+        not independently onto the raw body -- otherwise the two ops would
+        each build their own disconnected top-level shape and the export
+        would either miss the fused material or leave the cavity unfilled."""
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "chain-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "BasePlate",
+                            "length": 10.0, "width": 10.0, "height": 10.0,
+                        },
+                        {
+                            "id": 2,
+                            "type": "additive_section_loft",
+                            "name": "Rim",
+                            "ruled": True,
+                            "sections": [
+                                {"z": 10.0, "points": [[0, 0], [5, 0], [5, 5], [0, 5]]},
+                                {"z": 12.0, "points": [[1, 1], [4, 1], [4, 4], [1, 4]]},
+                            ],
+                        },
+                        {
+                            "id": 3,
+                            "type": "subtractive_section_loft",
+                            "name": "Cavity",
+                            "ruled": True,
+                            "sections": [
+                                {"z": 2.0, "points": [[1, 1], [4, 1], [4, 4], [1, 4]]},
+                                {"z": 4.0, "points": [[2, 2], [3, 2], [3, 3], [2, 3]]},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        # the additive fusion still starts from the raw body ...
+        assert "obj_Rim.Base = body_MainBody" in macro
+        # ... but the subtractive cut chains onto the fused result, not the
+        # raw body, so the final top-level shape includes both operations
+        assert "obj_Cavity.Base = obj_Rim" in macro
+
+    def test_after_cuts_fuse_and_cut_run_after_the_normal_phases(self):
+        """Regression for the volume campaign iteration 3 cut-then-restore
+        fix: a socket tube rebuilt inside a chamber whose main_cavity is
+        itself now a subtractive_section_loft (instead of an in-tree
+        PartDesign::Pocket) must be added back AFTER that cavity cut runs,
+        not before -- otherwise the cavity cut erases it wholesale. The
+        after_cuts fuse chains onto the cavity cut's result, and the
+        after_cuts bore-redrill cut chains onto that fuse."""
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "after-cuts-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "BasePlate",
+                            "length": 10.0, "width": 10.0, "height": 10.0,
+                        },
+                        {
+                            "id": 2,
+                            "type": "subtractive_section_loft",
+                            "name": "Cavity",
+                            "ruled": True,
+                            "sections": [
+                                {"z": 2.0, "points": [[1, 1], [4, 1], [4, 4], [1, 4]]},
+                                {"z": 4.0, "points": [[2, 2], [3, 2], [3, 3], [2, 3]]},
+                            ],
+                        },
+                        {
+                            "id": 3,
+                            "type": "additive_section_loft",
+                            "name": "SocketRing",
+                            "ruled": True,
+                            "after_cuts": True,
+                            "sections": [
+                                {"z": 2.0, "points": [[2, 2], [3, 2], [3, 3], [2, 3]]},
+                                {"z": 3.0, "points": [[2, 2], [3, 2], [3, 3], [2, 3]]},
+                            ],
+                        },
+                        {
+                            "id": 4,
+                            "type": "subtractive_section_loft",
+                            "name": "SocketBore",
+                            "ruled": True,
+                            "after_cuts": True,
+                            "sections": [
+                                {"z": 2.0, "points": [[2.3, 2.3], [2.7, 2.3], [2.7, 2.7], [2.3, 2.7]]},
+                                {"z": 3.0, "points": [[2.3, 2.3], [2.7, 2.3], [2.7, 2.7], [2.3, 2.7]]},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        # the cavity cut chains onto the raw body (nothing ran before it)
+        assert "obj_Cavity.Base = body_MainBody" in macro
+        # the deferred socket-ring fuse chains onto the cavity cut's result
+        assert "obj_SocketRing.Base = obj_Cavity" in macro
+        # the deferred socket-bore cut chains onto the socket-ring fuse
+        assert "obj_SocketBore.Base = obj_SocketRing" in macro
+        # deferred fuses/cuts use their own loft variable namespace
+        assert "post_cut_section_loft_1_shape = _section_loft_solid(" in macro
+        assert "post_cut_subtractive_loft_1_shape = _section_loft_solid(" in macro
 
     def test_top_rim_selector_accepted_and_bound(self):
         # top_rim is a valid semantic selector (mirror of bottom_rim at ZMax);

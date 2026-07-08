@@ -664,6 +664,7 @@ def additive_section_loft(
     sections: List[Dict[str, Any]],
     ruled: bool = True,
     redrill_holes: Optional[List[Dict[str, Any]]] = None,
+    after_cuts: bool = False,
     name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Add a generic multi-section point-loft feature to a body.
@@ -701,6 +702,16 @@ def additive_section_loft(
         knowledge of holes already cut into the body below the loft and
         would otherwise refill them wherever the (hole-less) loft solid
         overlaps the hole's footprint.
+    after_cuts:
+        If ``True``, defer this fuse until after every normal-phase cut
+        (bayonet grooves, ``subtractive_section_loft``) has already run,
+        instead of the default (fused right away, before any cuts). For a
+        "cut-then-restore" island that must be added back INTO a cavity
+        which is itself now cut doc-level rather than in-tree (e.g. a
+        socket tube rebuilt inside a chamber whose main_cavity became a
+        ``subtractive_section_loft``) -- without this, the island would be
+        fused onto the not-yet-hollowed body and then erased wholesale when
+        the cavity cut runs afterward.
     name:
         Optional explicit feature name.
 
@@ -756,6 +767,102 @@ def additive_section_loft(
         "ruled": bool(ruled),
         "redrill_holes": normalized_redrill,
     }
+    if after_cuts:
+        feature["after_cuts"] = True
+    if name is not None:
+        feature["name"] = name
+
+    body["features"].append(feature)
+    return feature
+
+
+def subtractive_section_loft(
+    project: Dict[str, Any],
+    body_index: int,
+    sections: List[Dict[str, Any]],
+    ruled: bool = True,
+    after_cuts: bool = False,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Add a generic multi-section point-loft feature that cuts a body.
+
+    Subtractive twin of :func:`additive_section_loft`: builds the same kind
+    of loft solid from a stack of measured absolute-coordinate polygon
+    cross-sections, but realises it doc-level as a ``Part::Cut`` (removing
+    material) instead of a ``Part::Fuse``. Like the additive twin and
+    ``bayonet_groove``'s swept cuts, the raw ``Part.makeLoft`` shape cannot
+    be spliced into a live PartDesign tip mid-tree, so the cut is realised
+    doc-level after the body is recomputed -- and, when the body also
+    carries an ``additive_section_loft`` or a ``bayonet_groove``, chained
+    after that op's result rather than the raw body (see
+    ``freecad_macro_gen`` for the doc-level ordering: additive fusions
+    always run before cuts).
+
+    Parameters
+    ----------
+    project:
+        The project dictionary.
+    body_index:
+        Index of the target body; the loft solid is cut from this body's
+        current top-level shape.
+    sections:
+        Ordered list of ``{"z": float, "points": [[x, y], ...]}`` dicts,
+        identical format to :func:`additive_section_loft` -- at least 3
+        sections, each with at least 8 points, all sections sharing the same
+        point count.
+    ruled:
+        If ``True`` (default), use straight ruled surfaces between sections;
+        if ``False``, a smooth (spline-blended) loft is built instead.
+    after_cuts:
+        If ``True``, defer this cut until after every normal-phase cut has
+        already run and after any ``after_cuts`` fuse on the same body --
+        e.g. re-drilling a socket tube's bore right after that tube was
+        itself restored post-cavity-cut (see :func:`additive_section_loft`'s
+        ``after_cuts`` for the full "cut-then-restore" rationale).
+    name:
+        Optional explicit feature name.
+
+    Returns
+    -------
+    Dict[str, Any]
+        The newly created feature dictionary.
+    """
+    _validate_project(project)
+    body = _get_body(project, body_index)
+
+    if not body["features"]:
+        raise ValueError("Cannot add a section loft to a body with no existing features")
+    if not isinstance(sections, (list, tuple)) or len(sections) < 3:
+        raise ValueError("subtractive_section_loft requires at least 3 sections")
+
+    normalized_sections: List[Dict[str, Any]] = []
+    n_points: Optional[int] = None
+    for sec in sections:
+        if not isinstance(sec, dict) or "z" not in sec or "points" not in sec:
+            raise ValueError("Each section requires a 'z' value and a 'points' list")
+        points = sec["points"]
+        if not isinstance(points, (list, tuple)) or len(points) < 8:
+            raise ValueError("Each section requires at least 8 points")
+        if n_points is None:
+            n_points = len(points)
+        elif len(points) != n_points:
+            raise ValueError(
+                f"All sections must have the same point count "
+                f"(first section has {n_points}, another has {len(points)})"
+            )
+        normalized_sections.append({
+            "z": float(sec["z"]),
+            "points": [[float(p[0]), float(p[1])] for p in points],
+        })
+
+    feature: Dict[str, Any] = {
+        "id": _next_feature_id(body),
+        "type": "subtractive_section_loft",
+        "sections": normalized_sections,
+        "ruled": bool(ruled),
+    }
+    if after_cuts:
+        feature["after_cuts"] = True
     if name is not None:
         feature["name"] = name
 
