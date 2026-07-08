@@ -58,6 +58,7 @@ from cli_anything.freecad.core.body import (
     additive_box,
     additive_cone,
     additive_cylinder,
+    additive_section_loft,
     bayonet_groove,
     create_body,
     pad,
@@ -833,6 +834,98 @@ class TestFreeCADBackend:
         )
         print(f"\n  loft wedge bite: {removed:.2f} mm^3 "
               f"(none={volumes['none']:.1f}, wedge={volumes['wedge']:.1f})")
+
+    def _square_loft_points(self, cx, cy, half):
+        """12-point outline of an exact square (3 evenly-spaced points per
+        side) centered at (cx, cy), used so a ruled loft between scaled
+        copies produces an analytically checkable frustum-stack volume.
+        """
+        corners = [(-half, -half), (half, -half), (half, half), (-half, half)]
+        pts = []
+        for i in range(4):
+            x0, y0 = corners[i]
+            x1, y1 = corners[(i + 1) % 4]
+            for t in (0.0, 1.0 / 3.0, 2.0 / 3.0):
+                pts.append([cx + x0 + (x1 - x0) * t, cy + y0 + (y1 - y0) * t])
+        return pts
+
+    def test_additive_section_loft_matches_prismatic_average_off_origin(self, tmp_path):
+        """Regression for the FreeCAD-STL-Importer Issue #22 lid loft: a
+        generic additive multi-section loft, built from raw polygon
+        cross-sections (not Sketcher profiles) and fused doc-level onto a
+        body, must produce the expected solid even when its center sits away
+        from the document origin. A 3-level loft (10x10 -> 8x8 -> 10x10
+        squares) is a stack of two square frustums; for a ruled loft between
+        linearly-scaled, correspondence-aligned square outlines, the volume
+        of each segment is the exact frustum integral
+        ``h * (s0**2 + s0*s1 + s1**2) / 3``.
+        """
+        cx, cy = 7.0, 5.0
+
+        def build(name: str, with_loft: bool) -> dict:
+            proj = create_document(name=name)
+            create_body(proj)
+            additive_box(proj, body_index=0, length=10.0, width=10.0, height=2.0,
+                        position=[cx - 5.0, cy - 5.0, 0.0])
+            if with_loft:
+                sections = [
+                    {"z": 2.0, "points": self._square_loft_points(cx, cy, 5.0)},
+                    {"z": 4.0, "points": self._square_loft_points(cx, cy, 4.0)},
+                    {"z": 6.0, "points": self._square_loft_points(cx, cy, 5.0)},
+                ]
+                additive_section_loft(proj, body_index=0, sections=sections, ruled=True)
+            return proj
+
+        volumes = {}
+        for label, with_loft in (("box_only", False), ("with_loft", True)):
+            proj = build(f"SectionLoft_{label}", with_loft)
+            output = str(tmp_path / f"loft_{label}.stl")
+            export_project(proj, output, preset="stl")
+            volumes[label] = _stl_mesh_volume(output)
+
+        box_volume = 10.0 * 10.0 * 2.0
+        assert abs(volumes["box_only"] - box_volume) < 0.05 * box_volume, (
+            f"sanity check: base box alone should be ~{box_volume:.1f} mm^3, "
+            f"got {volumes['box_only']:.1f} mm^3"
+        )
+
+        seg1 = 2.0 * (10.0 ** 2 + 10.0 * 8.0 + 8.0 ** 2) / 3.0
+        seg2 = 2.0 * (8.0 ** 2 + 8.0 * 10.0 + 10.0 ** 2) / 3.0
+        expected_total = box_volume + seg1 + seg2
+
+        assert abs(volumes["with_loft"] - expected_total) < 0.05 * expected_total, (
+            f"expected ~{expected_total:.1f} mm^3 (box {box_volume:.1f} + "
+            f"loft {seg1 + seg2:.1f}), got {volumes['with_loft']:.1f} mm^3"
+        )
+        print(f"\n  section loft volume: {volumes['with_loft']:.2f} mm^3 "
+              f"(expected ~{expected_total:.2f} mm^3, box-only={volumes['box_only']:.2f})")
+
+    def test_additive_section_loft_rejects_mismatched_point_counts(self):
+        """A section loft with sections that don't all share the same point
+        count must fail fast with a ValueError rather than silently building
+        a twisted or self-intersecting OCCT loft.
+        """
+        proj = create_document(name="LoftValidation")
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10.0, width=10.0, height=2.0)
+
+        good = self._square_loft_points(0.0, 0.0, 5.0)
+        short = good[:-1]
+        with pytest.raises(ValueError):
+            additive_section_loft(
+                proj, body_index=0,
+                sections=[
+                    {"z": 2.0, "points": good},
+                    {"z": 4.0, "points": short},
+                    {"z": 6.0, "points": good},
+                ],
+            )
+        # fewer than 3 sections is also rejected
+        with pytest.raises(ValueError):
+            additive_section_loft(
+                proj, body_index=0,
+                sections=[{"z": 2.0, "points": good}, {"z": 4.0, "points": good}],
+            )
 
     @pytest.mark.skipif(not _has_freecad_preview(), reason="GUI-capable FreeCAD not installed")
     def test_preview_capture_bundle(self, tmp_path):

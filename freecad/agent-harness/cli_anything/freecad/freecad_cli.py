@@ -1517,6 +1517,33 @@ def body_bayonet_groove(body_index: int, segments_json: str, wall_radius: float,
     output_fn(result, "Added bayonet groove")
 
 
+@body_group.command("additive-section-loft")
+@click.argument("body_index", type=int)
+@click.option("--sections-json", required=True,
+              help="JSON list of {z, points} closed-polygon cross-sections "
+                   "(>=3 sections, each with >=8 points, equal point counts).")
+@click.option("--ruled/--no-ruled", default=True,
+              help="Straight ruled surfaces (default) vs. a smooth spline loft.")
+@click.option("--redrill-holes-json", default=None,
+              help="JSON list of {cx, cy, radius, z0, z1} holes to re-cut "
+                   "doc-level after the loft fuse (holes whose Z range "
+                   "overlaps the loft band would otherwise be refilled).")
+@handle_error
+def body_additive_section_loft(body_index: int, sections_json: str, ruled: bool,
+                                redrill_holes_json: Optional[str]) -> None:
+    """Add a measured multi-section point loft, fused onto the body."""
+    sections = json.loads(sections_json)
+    redrill_holes = json.loads(redrill_holes_json) if redrill_holes_json else None
+    sess = get_session()
+    sess.snapshot(f"Additive section loft body #{body_index}")
+    proj = sess.get_project()
+    result = body_mod.additive_section_loft(
+        proj, body_index, sections=sections, ruled=ruled,
+        redrill_holes=redrill_holes,
+    )
+    output_fn(result, "Added additive section loft")
+
+
 # -- Body: Additive primitives --
 
 @body_group.command("additive-box")

@@ -46,6 +46,7 @@ from cli_anything.freecad.core.body import (
     additive_box,
     additive_cone,
     additive_cylinder,
+    additive_section_loft,
     bayonet_groove,
     chamfer,
     create_body,
@@ -732,6 +733,137 @@ class TestBody:
         assert ".Base = body_Neck" in macro
         # the second channel is rotated by 180 deg (symmetry=2): 130 -> 310
         assert "310.0" in macro
+
+    def test_macro_anchors_per_segment_radius_and_depth(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "bayonet-local",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "Neck",
+                    "features": [
+                        {"id": 1, "type": "additive_cylinder", "name": "NeckWall",
+                         "radius": 6.2, "height": 7.5},
+                        {
+                            "id": 2, "type": "bayonet_groove", "name": "Bayonet",
+                            "wall_radius": 6.26, "depth": 0.9,
+                            "center_x": 0.0, "center_y": 0.0, "symmetry": 1,
+                            "segments": [
+                                # measured per-band sector: own ridge and depth
+                                {"kind": "circumferential", "angle0": 69.0,
+                                 "angle1": 157.0, "z0": 8.9, "z1": 9.4,
+                                 "wall_radius": 5.31, "depth": 1.93},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+        # the emitted helper anchors the band to per-segment values
+        assert "seg.get('wall_radius', r_outer)" in macro
+        assert "seg.get('depth', depth)" in macro
+        # and the measured segment values ride along in the channel spec
+        assert "'wall_radius': 5.31" in macro
+        assert "'depth': 1.93" in macro
+
+    def _square_section(self, z, half, cx=0.0, cy=0.0):
+        return {
+            "z": z,
+            "points": [
+                [cx + half, cy - half], [cx + half * 0.7071, cy - half * 0.7071],
+                [cx + half * 0.7071 * 1.0, cy], [cx + half, cy + half * 0.3],
+                [cx + half * 0.3, cy + half], [cx, cy + half],
+                [cx - half * 0.3, cy + half], [cx - half, cy + half * 0.3],
+                [cx - half, cy - half * 0.3], [cx - half * 0.3, cy - half],
+                [cx + half * 0.3, cy - half], [cx + half * 0.7, cy - half],
+            ],
+        }
+
+    def test_additive_section_loft_feature_recorded(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10, width=10, height=5)
+        sections = [
+            self._square_section(z=5.0, half=5.0 + i)
+            for i, z in enumerate([5.0, 7.5, 10.0])
+        ]
+        feat = additive_section_loft(proj, body_index=0, sections=sections, ruled=True)
+        assert feat["type"] == "additive_section_loft"
+        assert len(feat["sections"]) == 3
+        assert feat["ruled"] is True
+        assert feat["redrill_holes"] == []
+
+    def test_additive_section_loft_validation(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10, width=10, height=5)
+        # too few sections
+        with pytest.raises(ValueError):
+            additive_section_loft(
+                proj, body_index=0,
+                sections=[self._square_section(5.0, 5.0), self._square_section(7.5, 5.0)],
+            )
+        # mismatched point counts across sections
+        sec_a = self._square_section(5.0, 5.0)
+        sec_b = self._square_section(7.5, 5.0)
+        sec_b["points"] = sec_b["points"][:-1]
+        sec_c = self._square_section(10.0, 5.0)
+        with pytest.raises(ValueError):
+            additive_section_loft(proj, body_index=0, sections=[sec_a, sec_b, sec_c])
+
+    def test_macro_binds_section_loft_fuse_and_redrill(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "loft-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "BasePlate",
+                            "length": 10.0, "width": 10.0, "height": 2.0,
+                        },
+                        {
+                            "id": 2,
+                            "type": "additive_section_loft",
+                            "name": "Lid",
+                            "ruled": True,
+                            "sections": [
+                                {"z": 2.0, "points": [[0, 0], [5, 0], [5, 5], [0, 5]]},
+                                {"z": 4.0, "points": [[1, 1], [4, 1], [4, 4], [1, 4]]},
+                            ],
+                            "redrill_holes": [
+                                {"cx": 2.5, "cy": 2.5, "radius": 0.5, "z0": 0.0, "z1": 3.0},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        assert "def _section_loft_solid(" in macro
+        assert "section_loft_1_shape = _section_loft_solid(" in macro
+        assert "doc.addObject('Part::Fuse', 'Lid')" in macro
+        assert "obj_Lid.Base = body_MainBody" in macro
+        assert "obj_Lid.Tool = section_loft_1" in macro
+        # the redrill hole is re-cut doc-level after the fuse
+        assert "Part.makeCylinder(0.5, 3.0, FreeCAD.Vector(2.5, 2.5, 0.0)" in macro
+        assert "doc.addObject('Part::Cut', 'Lid_redrilled')" in macro
+        assert "obj_Lid_redrilled.Base = obj_Lid" in macro
 
     def test_top_rim_selector_accepted_and_bound(self):
         # top_rim is a valid semantic selector (mirror of bottom_rim at ZMax);

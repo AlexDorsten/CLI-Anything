@@ -531,12 +531,32 @@ def _gen_bodies(project: dict) -> List[str]:
             "        solid = solid.fuse(extra)",
             "    return solid",
             "",
+            "def _section_loft_solid(sections, ruled):",
+            "    # Build a solid loft directly from absolute-coordinate polygon",
+            "    # sections (e.g. planar slices of a source mesh), rather than from",
+            "    # Sketcher profiles. Each section is {'z': float, 'points': [[x, y],",
+            "    # ...]} describing one closed polygon at that Z height; all sections",
+            "    # must share the same point count so the ruled/smooth loft pairs",
+            "    # vertices index-by-index instead of guessing a correspondence.",
+            "    wires = []",
+            "    for section in sections:",
+            "        z = section['z']",
+            "        pts = [FreeCAD.Vector(p[0], p[1], z) for p in section['points']]",
+            "        pts.append(pts[0])",
+            "        wires.append(Part.makePolygon(pts))",
+            "    return Part.makeLoft(wires, True, ruled)",
+            "",
         ]
     )
 
     # Collect (body_var, groove_feature) so bayonet swept-cuts can be applied
     # as doc-level Part::Cut operations after each body has been recomputed.
     bayonet_cuts: List[tuple[str, str, Dict[str, Any]]] = []
+    # Collect (body_var, loft_feature) so measured multi-section lofts can be
+    # fused onto the body's shape doc-level after each body is recomputed
+    # (raw Part.makeLoft shapes cannot be spliced into a live PartDesign tip
+    # mid-tree, same constraint as the bayonet swept cuts above).
+    section_lofts: List[tuple[str, str, Dict[str, Any]]] = []
 
     for body in bodies:
         body_name = _safe_name(body.get("name", "Body"))
@@ -768,6 +788,13 @@ def _gen_bodies(project: dict) -> List[str]:
                 # a live PartDesign tip mid-tree).
                 bayonet_cuts.append((body_var, feat_name, feat))
 
+            elif feat_type == "additive_section_loft":
+                # Measured multi-section point loft. Recorded here and
+                # realised as a doc-level Part::Fuse once the body has been
+                # recomputed (raw Part.makeLoft shapes cannot be spliced into
+                # a live PartDesign tip mid-tree).
+                section_lofts.append((body_var, feat_name, feat))
+
             else:
                 lines.append(
                     f"# WARNING: Unknown feature type '{feat_type}' "
@@ -776,7 +803,7 @@ def _gen_bodies(project: dict) -> List[str]:
 
             lines.append("")
 
-    if bayonet_cuts:
+    if bayonet_cuts or section_lofts:
         lines.append("doc.recompute()")
         lines.append("")
     for cut_index, (body_var, feat_name, feat) in enumerate(bayonet_cuts, start=1):
@@ -839,6 +866,61 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"    {cut_var}.Base = {body_var}")
         lines.append(f"    {cut_var}.Tool = {tool_var}")
         lines.append("")
+
+    for loft_index, (body_var, feat_name, feat) in enumerate(section_lofts, start=1):
+        sections = feat.get("sections", [])
+        ruled = bool(feat.get("ruled", True))
+        redrill_holes = feat.get("redrill_holes") or []
+        safe_feat_name = _safe_name(feat_name)
+
+        loft_var = f"section_loft_{loft_index}"
+        lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
+        lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
+        lines.append(f"{loft_var}.Shape = {loft_var}_shape")
+        lines.append(f"{loft_var}.Visibility = False")
+
+        fuse_var = f"obj_{safe_feat_name}"
+        lines.append(f"{fuse_var} = doc.addObject('Part::Fuse', '{safe_feat_name}')")
+        lines.append(f"{fuse_var}.Base = {body_var}")
+        lines.append(f"{fuse_var}.Tool = {loft_var}")
+        lines.append("")
+
+        if redrill_holes:
+            # A plain Part::Fuse has no notion of holes already cut into the
+            # body below the loft's Z band: wherever the (hole-less) loft
+            # solid overlaps a hole's XY footprint, the union silently
+            # refills it. Re-cut each affected hole doc-level, after the
+            # fuse, with a plain cylinder spanning its full original depth.
+            redrill_var = f"redrill_{loft_index}"
+            lines.append(f"{redrill_var}_pieces = []")
+            for hole in redrill_holes:
+                cx = float(hole["cx"])
+                cy = float(hole["cy"])
+                radius = float(hole["radius"])
+                z0 = float(hole.get("z0", 0.0))
+                z1 = float(hole["z1"])
+                height = z1 - z0
+                lines.append(
+                    f"{redrill_var}_pieces.append(Part.makeCylinder("
+                    f"{radius}, {height}, FreeCAD.Vector({cx}, {cy}, {z0}), "
+                    f"FreeCAD.Vector(0, 0, 1)))"
+                )
+            lines.append(f"{redrill_var}_shape = {redrill_var}_pieces[0]")
+            lines.append(f"for _extra in {redrill_var}_pieces[1:]:")
+            lines.append(f"    {redrill_var}_shape = {redrill_var}_shape.fuse(_extra)")
+            lines.append(
+                f"{redrill_var}_tool = doc.addObject('Part::Feature', "
+                f"'{safe_feat_name}_redrill_tool')"
+            )
+            lines.append(f"{redrill_var}_tool.Shape = {redrill_var}_shape")
+            lines.append(f"{redrill_var}_tool.Visibility = False")
+            recut_var = f"{fuse_var}_redrilled"
+            lines.append(
+                f"{recut_var} = doc.addObject('Part::Cut', '{safe_feat_name}_redrilled')"
+            )
+            lines.append(f"{recut_var}.Base = {fuse_var}")
+            lines.append(f"{recut_var}.Tool = {redrill_var}_tool")
+            lines.append("")
 
     return lines
 

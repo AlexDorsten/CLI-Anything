@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Union
 
 VALID_FEATURE_TYPES = {
     "pad", "pocket", "fillet", "chamfer", "revolution",
-    "additive_loft", "additive_pipe", "additive_helix",
+    "additive_loft", "additive_section_loft", "additive_pipe", "additive_helix",
     "additive_box", "additive_cylinder", "additive_sphere",
     "additive_cone", "additive_torus", "additive_wedge",
     "groove", "subtractive_loft", "subtractive_pipe", "subtractive_helix",
@@ -653,6 +653,111 @@ def additive_loft(
         "solid": bool(solid),
         "ruled": bool(ruled),
     }
+
+    body["features"].append(feature)
+    return feature
+
+
+def additive_section_loft(
+    project: Dict[str, Any],
+    body_index: int,
+    sections: List[Dict[str, Any]],
+    ruled: bool = True,
+    redrill_holes: Optional[List[Dict[str, Any]]] = None,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Add a generic multi-section point-loft feature to a body.
+
+    Unlike :func:`additive_loft` (which lofts between existing Sketcher
+    profiles), this builds the loft directly from a stack of measured
+    absolute-coordinate polygon cross-sections -- e.g. sliced planar contours
+    from a source mesh. Each polygon is turned into a closed wire and the
+    stack is passed through ``Part.makeLoft``. Because raw ``Part`` shapes
+    cannot be spliced into a live PartDesign tip mid-tree, the loft solid is
+    realised doc-level and fused onto the body's final shape after the body
+    is recomputed (the same pattern used for ``bayonet_groove``'s swept
+    cuts).
+
+    Parameters
+    ----------
+    project:
+        The project dictionary.
+    body_index:
+        Index of the target body; the loft is fused onto this body's shape.
+    sections:
+        Ordered list of ``{"z": float, "points": [[x, y], ...]}`` dicts, each
+        describing one closed polygon cross-section in absolute XY
+        coordinates at that Z height. At least 3 sections are required, each
+        with at least 8 points, and every section must have the same point
+        count (OCCT's ruled/smooth loft pairs vertices index-by-index across
+        wires, so a twisted or mismatched vertex order distorts the surface).
+    ruled:
+        If ``True`` (default), use straight ruled surfaces between sections;
+        if ``False``, a smooth (spline-blended) loft is built instead.
+    redrill_holes:
+        Optional list of ``{"cx", "cy", "radius", "z0", "z1"}`` dicts. Any
+        hole whose Z range overlaps the loft's Z band gets re-cut doc-level
+        *after* the loft fuse, because a plain ``Part::Fuse`` has no
+        knowledge of holes already cut into the body below the loft and
+        would otherwise refill them wherever the (hole-less) loft solid
+        overlaps the hole's footprint.
+    name:
+        Optional explicit feature name.
+
+    Returns
+    -------
+    Dict[str, Any]
+        The newly created feature dictionary.
+    """
+    _validate_project(project)
+    body = _get_body(project, body_index)
+
+    if not body["features"]:
+        raise ValueError("Cannot add a section loft to a body with no existing features")
+    if not isinstance(sections, (list, tuple)) or len(sections) < 3:
+        raise ValueError("additive_section_loft requires at least 3 sections")
+
+    normalized_sections: List[Dict[str, Any]] = []
+    n_points: Optional[int] = None
+    for sec in sections:
+        if not isinstance(sec, dict) or "z" not in sec or "points" not in sec:
+            raise ValueError("Each section requires a 'z' value and a 'points' list")
+        points = sec["points"]
+        if not isinstance(points, (list, tuple)) or len(points) < 8:
+            raise ValueError("Each section requires at least 8 points")
+        if n_points is None:
+            n_points = len(points)
+        elif len(points) != n_points:
+            raise ValueError(
+                f"All sections must have the same point count "
+                f"(first section has {n_points}, another has {len(points)})"
+            )
+        normalized_sections.append({
+            "z": float(sec["z"]),
+            "points": [[float(p[0]), float(p[1])] for p in points],
+        })
+
+    normalized_redrill: List[Dict[str, Any]] = []
+    for hole in redrill_holes or []:
+        if "cx" not in hole or "cy" not in hole or "radius" not in hole or "z1" not in hole:
+            raise ValueError("Each redrill hole requires 'cx', 'cy', 'radius', and 'z1'")
+        normalized_redrill.append({
+            "cx": float(hole["cx"]),
+            "cy": float(hole["cy"]),
+            "radius": float(hole["radius"]),
+            "z0": float(hole.get("z0", 0.0)),
+            "z1": float(hole["z1"]),
+        })
+
+    feature: Dict[str, Any] = {
+        "id": _next_feature_id(body),
+        "type": "additive_section_loft",
+        "sections": normalized_sections,
+        "ruled": bool(ruled),
+        "redrill_holes": normalized_redrill,
+    }
+    if name is not None:
+        feature["name"] = name
 
     body["features"].append(feature)
     return feature
