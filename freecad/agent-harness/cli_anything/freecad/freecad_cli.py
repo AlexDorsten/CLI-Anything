@@ -1484,6 +1484,39 @@ def body_subtractive_helix(body_index: int, sketch_index: int, pitch: float,
     output_fn(result, "Added subtractive helix")
 
 
+@body_group.command("bayonet-groove")
+@click.argument("body_index", type=int)
+@click.option("--segments-json", required=True,
+              help="JSON list of L-path segment dicts for one channel.")
+@click.option("--wall-radius", required=True, type=float,
+              help="Outer radius of the intact neck wall.")
+@click.option("--depth", required=True, type=float,
+              help="Radial depth the grooves are cut inward.")
+@click.option("--center-x", default=0.0, type=float, help="Neck axis x.")
+@click.option("--center-y", default=0.0, type=float, help="Neck axis y.")
+@click.option("--half-width", default=6.0, type=float,
+              help="Default angular half-width (deg) of axial slots.")
+@click.option("--overcut", default=0.5, type=float,
+              help="Extra radial reach beyond the wall for a clean cut.")
+@click.option("--symmetry", default=2, type=int,
+              help="Number of equally spaced channel copies.")
+@handle_error
+def body_bayonet_groove(body_index: int, segments_json: str, wall_radius: float,
+                        depth: float, center_x: float, center_y: float,
+                        half_width: float, overcut: float, symmetry: int) -> None:
+    """Add a swept-cut bayonet groove (L-path wrapped on the neck wall)."""
+    segments = json.loads(segments_json)
+    sess = get_session()
+    sess.snapshot(f"Bayonet groove body #{body_index}")
+    proj = sess.get_project()
+    result = body_mod.bayonet_groove(
+        proj, body_index, segments=segments, wall_radius=wall_radius,
+        depth=depth, center_x=center_x, center_y=center_y,
+        half_width=half_width, overcut=overcut, symmetry=symmetry,
+    )
+    output_fn(result, "Added bayonet groove")
+
+
 # -- Body: Additive primitives --
 
 @body_group.command("additive-box")
