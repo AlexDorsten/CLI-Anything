@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import struct
 import subprocess
@@ -20,7 +21,11 @@ from copy import deepcopy
 from typing import List
 
 import pytest
-from PIL import Image, ImageChops
+try:  # Pillow is only needed by the GUI-preview assertions below; the
+    # headless backend tests must stay runnable without it.
+    from PIL import Image, ImageChops
+except ImportError:  # pragma: no cover
+    Image = ImageChops = None
 
 # ---------------------------------------------------------------------------
 # Imports from the harness under test
@@ -53,6 +58,7 @@ from cli_anything.freecad.core.body import (
     additive_box,
     additive_cone,
     additive_cylinder,
+    bayonet_groove,
     create_body,
     pad,
     pocket,
@@ -122,6 +128,8 @@ def _assert_png(path):
 
 
 def _assert_png_not_blank(path):
+    if Image is None:
+        pytest.skip("Pillow not installed")
     _assert_png(path)
     image = Image.open(path).convert("L")
     extrema = image.getextrema()
@@ -129,6 +137,8 @@ def _assert_png_not_blank(path):
 
 
 def _assert_images_differ(path_a, path_b):
+    if Image is None:
+        pytest.skip("Pillow not installed")
     image_a = Image.open(path_a).convert("RGB")
     image_b = Image.open(path_b).convert("RGB")
     diff = ImageChops.difference(image_a, image_b)
@@ -536,6 +546,40 @@ class TestIntermediateFiles:
 # 2. FreeCAD backend tests (require FreeCAD installed)
 # =========================================================================
 
+def _stl_mesh_volume(path: str) -> float:
+    """Signed volume (mm^3) of a closed STL mesh via the divergence theorem."""
+
+    def tet(v0, v1, v2) -> float:
+        return (
+            v0[0] * (v1[1] * v2[2] - v1[2] * v2[1])
+            - v0[1] * (v1[0] * v2[2] - v1[2] * v2[0])
+            + v0[2] * (v1[0] * v2[1] - v1[1] * v2[0])
+        ) / 6.0
+
+    with open(path, "rb") as f:
+        head = f.read(80)
+    volume = 0.0
+    if head.decode("ascii", errors="ignore").strip().lower().startswith("solid"):
+        verts: List[tuple] = []
+        with open(path, "r", encoding="ascii", errors="ignore") as f:
+            for line in f:
+                parts = line.split()
+                if parts[:1] == ["vertex"]:
+                    verts.append(tuple(float(p) for p in parts[1:4]))
+        for i in range(0, len(verts) - 2, 3):
+            volume += tet(verts[i], verts[i + 1], verts[i + 2])
+    else:
+        record = struct.Struct("<12fH")
+        with open(path, "rb") as f:
+            f.seek(80)
+            (count,) = struct.unpack("<I", f.read(4))
+            data = f.read(count * record.size)
+        for i in range(count):
+            vals = record.unpack_from(data, i * record.size)
+            volume += tet(vals[3:6], vals[6:9], vals[9:12])
+    return abs(volume)
+
+
 @pytest.mark.skipif(not _has_freecad(), reason="FreeCAD not installed")
 class TestFreeCADBackend:
     """Tests that require the real FreeCAD headless backend."""
@@ -632,6 +676,72 @@ class TestFreeCADBackend:
         assert size > 0, "FCStd file is empty"
 
         print(f"\n  FCStd: {output} ({size:,} bytes)")
+
+    def test_bayonet_cut_bites_narrowed_neck_via_segment_wall_radius(self, tmp_path):
+        """Regression for the FreeCAD-STL-Importer s15-full case: on a tapered
+        neck the detector's global wall_radius (6.26) over-reports the local
+        ridge (5.3), so the groove band ``[wall-depth, wall+over]`` floated
+        entirely outside the material and the swept cut removed 0 mm^3.
+        Per-segment ``wall_radius`` values must anchor the tool to the local
+        wall so the cut bites real volume; without them the old behavior
+        (inert cut) is reproduced.
+        """
+
+        def neck_project(name: str, groove: str) -> dict:
+            proj = create_document(name=name)
+            create_body(proj)
+            # narrowed (tapered-down) neck section: true local ridge r=5.3
+            additive_cylinder(proj, body_index=0, radius=5.3, height=7.5,
+                              position=[0, 0, 8.5])
+            if groove == "none":
+                return proj
+            segments = [
+                {"kind": "axial", "angle": 130.0, "half_width": 12.0,
+                 "z0": 9.0, "z1": 11.5},
+                {"kind": "circumferential", "angle0": 130.0, "angle1": 164.0,
+                 "z0": 11.5, "z1": 12.5},
+                {"kind": "axial", "angle": 164.0, "half_width": 6.0,
+                 "z0": 12.0, "z1": 14.5},
+            ]
+            if groove == "local":
+                for seg in segments:
+                    seg["wall_radius"] = 5.3
+            # global wall_radius deliberately over-reports the local ridge
+            bayonet_groove(proj, body_index=0, segments=segments,
+                           wall_radius=6.26, depth=0.9,
+                           center_x=0.0, center_y=0.0, symmetry=2)
+            return proj
+
+        volumes = {}
+        for label in ("none", "global", "local"):
+            proj = neck_project(f"BayonetTaper_{label}", label)
+            output = str(tmp_path / f"neck_{label}.stl")
+            export_project(proj, output, preset="stl")
+            volumes[label] = _stl_mesh_volume(output)
+
+        # sanity: the export contains exactly the cut result, not the uncut
+        # body or the groove tool overlaid on top of it
+        intact = math.pi * 5.3**2 * 7.5
+        assert abs(volumes["none"] - intact) < 0.05 * intact, (
+            f"ungrooved neck export should be one clean cylinder shell "
+            f"(~{intact:.0f} mm^3), got {volumes['none']:.1f} mm^3"
+        )
+        # old behavior (global radius only): the tool floats outside the
+        # narrowed wall and removes essentially nothing
+        inert = volumes["none"] - volumes["global"]
+        assert abs(inert) < 1.0, (
+            f"expected an inert cut without per-segment radii, but it removed "
+            f"{inert:.2f} mm^3 (volumes: {volumes})"
+        )
+        # per-segment radii: the groove bites clearly into the wall
+        removed = volumes["none"] - volumes["local"]
+        assert removed > 5.0, (
+            f"per-segment wall_radius cut only {removed:.2f} mm^3 "
+            f"(volumes: {volumes})"
+        )
+        print(f"\n  bayonet bite: {removed:.1f} mm^3 "
+              f"(none={volumes['none']:.1f}, global={volumes['global']:.1f}, "
+              f"local={volumes['local']:.1f})")
 
     @pytest.mark.skipif(not _has_freecad_preview(), reason="GUI-capable FreeCAD not installed")
     def test_preview_capture_bundle(self, tmp_path):

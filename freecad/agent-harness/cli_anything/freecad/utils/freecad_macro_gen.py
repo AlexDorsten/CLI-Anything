@@ -442,8 +442,6 @@ def _gen_bodies(project: dict) -> List[str]:
             "    # are robust OCCT primitives (cylinders/boxes), so the swept cut never",
             "    # relies on wrapping a Sketcher wire onto a curved face.",
             "    import math",
-            "    r_in = r_outer - depth",
-            "    r_cut_out = r_outer + over",
             "    pieces = []",
             "    for seg in segments:",
             "        kind = seg.get('kind', 'circumferential')",
@@ -451,6 +449,15 @@ def _gen_bodies(project: dict) -> List[str]:
             "        h = z1 - z0",
             "        if h <= 0:",
             "            continue",
+            "        # Per-segment LOCAL ridge radius: on a tapered neck the outer",
+            "        # wall falls locally, so a single global r_outer leaves the tool",
+            "        # floating outside the material over parts of the z range. When",
+            "        # the detector supplies a per-segment wall_radius, anchor the",
+            "        # groove band to it so the cut always bites ~depth into the real",
+            "        # wall; otherwise fall back to the global r_outer.",
+            "        seg_r_outer = float(seg.get('wall_radius', r_outer))",
+            "        r_in = seg_r_outer - depth",
+            "        r_cut_out = seg_r_outer + over",
             "        if kind == 'circumferential':",
             "            a0 = float(seg['angle0']); a1 = float(seg['angle1'])",
             "            sweep = (a1 - a0) % 360.0",
@@ -465,7 +472,7 @@ def _gen_bodies(project: dict) -> List[str]:
             "            angle = float(seg.get('angle', 0.0))",
             "            hw = float(seg.get('half_width', half_width))",
             "            arc = math.radians(hw)",
-            "            tang = 2.0 * r_outer * math.sin(arc) if arc < math.pi / 2 else 2.0 * r_outer",
+            "            tang = 2.0 * seg_r_outer * math.sin(arc) if arc < math.pi / 2 else 2.0 * seg_r_outer",
             "            box = Part.makeBox(depth + over, tang, h, FreeCAD.Vector(r_in, -tang / 2.0, z0))",
             "            box.Placement = FreeCAD.Placement(FreeCAD.Vector(cx, cy, 0), FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), angle))",
             "            pieces.append(box)",
@@ -888,10 +895,15 @@ def _gen_export(
     lines.append("")
 
     # Collect all visible shape objects for export
-    lines.append("# Collect all shape objects for export")
+    lines.append("# Collect the top-level shape objects for export. Objects that are")
+    lines.append("# consumed by another feature (a Part::Cut/Fuse base or tool, the")
+    lines.append("# features inside a PartDesign body, a hidden groove tool solid) must")
+    lines.append("# NOT be exported alongside their result: meshing them too overlays")
+    lines.append("# the unmodified input over the result and e.g. fills a subtractive")
+    lines.append("# groove straight back in.")
     lines.append("export_objects = []")
     lines.append("for obj in doc.Objects:")
-    lines.append("    if hasattr(obj, 'Shape') and obj.Shape.isValid():")
+    lines.append("    if hasattr(obj, 'Shape') and obj.Shape.isValid() and not obj.InList:")
     lines.append("        export_objects.append(obj)")
     lines.append("")
 
