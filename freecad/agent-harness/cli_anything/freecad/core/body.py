@@ -21,7 +21,7 @@ VALID_FEATURE_TYPES = {
     "groove", "subtractive_loft", "subtractive_pipe", "subtractive_helix",
     "subtractive_box", "subtractive_cylinder", "subtractive_sphere",
     "subtractive_cone", "subtractive_torus", "subtractive_wedge",
-    "draft", "thickness",
+    "draft", "thickness", "bayonet_groove",
     "linear_pattern", "polar_pattern", "mirrored", "multi_transform",
     "hole", "datum_plane", "datum_line", "datum_point", "shape_binder",
     "local_coordinate_system",
@@ -349,6 +349,86 @@ def fillet(
         "type": "fillet",
         "radius": radius,
         "edges": edges,
+    }
+
+    body["features"].append(feature)
+    return feature
+
+
+def bayonet_groove(
+    project: Dict[str, Any],
+    body_index: int,
+    segments: List[Dict[str, Any]],
+    wall_radius: float,
+    depth: float,
+    center_x: float = 0.0,
+    center_y: float = 0.0,
+    half_width: float = 6.0,
+    overcut: float = 0.5,
+    symmetry: int = 2,
+) -> Dict[str, Any]:
+    """Add a swept-cut bayonet groove feature to a body.
+
+    The groove is described by one channel's ``segments`` (an L-path wrapped on
+    the neck cylinder wall); ``symmetry`` angular copies are generated at build
+    time.  Each segment is a dict with ``kind`` ``"circumferential"``
+    (``angle0``/``angle1``/``z0``/``z1``) or ``"axial"``
+    (``angle``/``half_width``/``z0``/``z1``).
+
+    Parameters
+    ----------
+    project:
+        The project dictionary.
+    body_index:
+        Index of the target body (the neck).
+    segments:
+        Ordered segment dicts describing one channel's L-path.
+    wall_radius:
+        Outer radius of the intact neck wall (grooves are cut inward).
+    depth:
+        Radial depth of the groove (``wall_radius - depth`` is the floor).
+    center_x, center_y:
+        Neck axis position in the build frame.
+    half_width:
+        Default angular half-width (deg) of axial slots.
+    overcut:
+        Extra radial reach beyond the wall so the cut fully clears the surface.
+    symmetry:
+        Number of equally spaced channel copies (2 for a two-start bayonet).
+
+    Returns
+    -------
+    Dict[str, Any]
+        The newly created bayonet groove feature dictionary.
+    """
+    _validate_project(project)
+    body = _get_body(project, body_index)
+
+    if not body["features"]:
+        raise ValueError("Cannot add a bayonet groove to a body with no existing features")
+    if not isinstance(segments, (list, tuple)) or not segments:
+        raise ValueError("Bayonet groove requires a non-empty list of segments")
+
+    wall_radius = float(wall_radius)
+    depth = float(depth)
+    if wall_radius <= 0:
+        raise ValueError(f"Wall radius must be positive, got {wall_radius}")
+    if not 0 < depth < wall_radius:
+        raise ValueError(f"Groove depth must be in (0, wall_radius), got {depth}")
+    if int(symmetry) < 1:
+        raise ValueError(f"Symmetry must be >= 1, got {symmetry}")
+
+    feature: Dict[str, Any] = {
+        "id": _next_feature_id(body),
+        "type": "bayonet_groove",
+        "segments": [dict(seg) for seg in segments],
+        "wall_radius": wall_radius,
+        "depth": depth,
+        "center_x": float(center_x),
+        "center_y": float(center_y),
+        "half_width": float(half_width),
+        "overcut": float(overcut),
+        "symmetry": int(symmetry),
     }
 
     body["features"].append(feature)

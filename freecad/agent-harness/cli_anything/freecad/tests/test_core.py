@@ -46,6 +46,7 @@ from cli_anything.freecad.core.body import (
     additive_box,
     additive_cone,
     additive_cylinder,
+    bayonet_groove,
     chamfer,
     create_body,
     datum_plane,
@@ -650,6 +651,87 @@ class TestBody:
         assert "_finishing_edges(feat_MainBody_2_chamfer.Shape, 'all')" in macro
         assert ".Size = 1.0" in macro
         assert ".Radius = 2.5" in macro
+
+    def test_bayonet_groove_feature_recorded(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_cylinder(proj, body_index=0, radius=6.2, height=7.5)
+        segments = [
+            {"kind": "axial", "angle": 130.0, "half_width": 12.0, "z0": 8.5, "z1": 11.0},
+            {"kind": "circumferential", "angle0": 130.0, "angle1": 164.0, "z0": 12.5, "z1": 13.5},
+            {"kind": "axial", "angle": 164.0, "half_width": 6.0, "z0": 13.0, "z1": 15.6},
+        ]
+        feat = bayonet_groove(
+            proj, body_index=0, segments=segments,
+            wall_radius=6.2, depth=0.9, center_x=7.2, center_y=7.2, symmetry=2,
+        )
+        assert feat["type"] == "bayonet_groove"
+        assert feat["symmetry"] == 2
+        assert len(feat["segments"]) == 3
+        assert feat["depth"] == 0.9
+
+    def test_bayonet_groove_validation(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_cylinder(proj, body_index=0, radius=6.2, height=7.5)
+        with pytest.raises(ValueError):
+            bayonet_groove(proj, body_index=0, segments=[], wall_radius=6.2, depth=0.9)
+        with pytest.raises(ValueError):
+            bayonet_groove(
+                proj, body_index=0,
+                segments=[{"kind": "axial", "angle": 0, "z0": 0, "z1": 1}],
+                wall_radius=6.2, depth=7.0,
+            )
+
+    def test_macro_binds_bayonet_swept_cut(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "bayonet-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "Neck",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_cylinder",
+                            "name": "NeckWall",
+                            "radius": 6.2,
+                            "height": 7.5,
+                        },
+                        {
+                            "id": 2,
+                            "type": "bayonet_groove",
+                            "name": "Bayonet",
+                            "wall_radius": 6.2,
+                            "depth": 0.9,
+                            "center_x": 7.2,
+                            "center_y": 7.2,
+                            "symmetry": 2,
+                            "segments": [
+                                {"kind": "axial", "angle": 130.0, "half_width": 12.0, "z0": 8.5, "z1": 11.0},
+                                {"kind": "circumferential", "angle0": 130.0, "angle1": 164.0, "z0": 12.5, "z1": 13.5},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        # helper for the wrapped swept-cut is emitted
+        assert "def _bayonet_channel_solid(" in macro
+        # two symmetric channels are generated (base + 180 deg copy)
+        assert macro.count("_chan = _bayonet_channel_solid(") == 2
+        # groove tool solid is cut from the neck body via Part::Cut
+        assert "doc.addObject('Part::Cut', 'Bayonet')" in macro
+        assert ".Base = body_Neck" in macro
+        # the second channel is rotated by 180 deg (symmetry=2): 130 -> 310
+        assert "310.0" in macro
 
     def test_top_rim_selector_accepted_and_bound(self):
         # top_rim is a valid semantic selector (mirror of bottom_rim at ZMax);

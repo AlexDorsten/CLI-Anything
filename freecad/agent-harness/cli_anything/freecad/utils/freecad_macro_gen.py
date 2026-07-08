@@ -434,8 +434,54 @@ def _gen_bodies(project: dict) -> List[str]:
             "        return names",
             "    raise RuntimeError('Unknown edge selector: %r' % (spec,))",
             "",
+            "def _bayonet_channel_solid(cx, cy, r_outer, depth, half_width, over, segments):",
+            "    # Build one bayonet channel as the union of swept sector solids along an",
+            "    # L-path wrapped on the neck cylinder. Each segment is either 'axial'",
+            "    # (a box slot at a fixed angle running in z) or 'circumferential' (an",
+            "    # annular sector spanning an angle range at a fixed z-band). All parts",
+            "    # are robust OCCT primitives (cylinders/boxes), so the swept cut never",
+            "    # relies on wrapping a Sketcher wire onto a curved face.",
+            "    import math",
+            "    r_in = r_outer - depth",
+            "    r_cut_out = r_outer + over",
+            "    pieces = []",
+            "    for seg in segments:",
+            "        kind = seg.get('kind', 'circumferential')",
+            "        z0 = float(seg['z0']); z1 = float(seg['z1'])",
+            "        h = z1 - z0",
+            "        if h <= 0:",
+            "            continue",
+            "        if kind == 'circumferential':",
+            "            a0 = float(seg['angle0']); a1 = float(seg['angle1'])",
+            "            sweep = (a1 - a0) % 360.0",
+            "            if sweep <= 0:",
+            "                sweep = 360.0",
+            "            outer = Part.makeCylinder(r_cut_out, h, FreeCAD.Vector(cx, cy, z0), FreeCAD.Vector(0, 0, 1), sweep)",
+            "            inner = Part.makeCylinder(r_in, h, FreeCAD.Vector(cx, cy, z0), FreeCAD.Vector(0, 0, 1), sweep)",
+            "            sector = outer.cut(inner)",
+            "            sector.Placement = FreeCAD.Placement(FreeCAD.Vector(cx, cy, 0), FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), a0), FreeCAD.Vector(cx, cy, 0))",
+            "            pieces.append(sector)",
+            "        else:  # axial slot centered at a given angle, spanning +-half_width",
+            "            angle = float(seg.get('angle', 0.0))",
+            "            hw = float(seg.get('half_width', half_width))",
+            "            arc = math.radians(hw)",
+            "            tang = 2.0 * r_outer * math.sin(arc) if arc < math.pi / 2 else 2.0 * r_outer",
+            "            box = Part.makeBox(depth + over, tang, h, FreeCAD.Vector(r_in, -tang / 2.0, z0))",
+            "            box.Placement = FreeCAD.Placement(FreeCAD.Vector(cx, cy, 0), FreeCAD.Rotation(FreeCAD.Vector(0, 0, 1), angle))",
+            "            pieces.append(box)",
+            "    if not pieces:",
+            "        return None",
+            "    solid = pieces[0]",
+            "    for extra in pieces[1:]:",
+            "        solid = solid.fuse(extra)",
+            "    return solid",
+            "",
         ]
     )
+
+    # Collect (body_var, groove_feature) so bayonet swept-cuts can be applied
+    # as doc-level Part::Cut operations after each body has been recomputed.
+    bayonet_cuts: List[tuple[str, str, Dict[str, Any]]] = []
 
     for body in bodies:
         body_name = _safe_name(body.get("name", "Body"))
@@ -660,6 +706,13 @@ def _gen_bodies(project: dict) -> List[str]:
                     lines.append(f"{feat_var}.Radius = {radius}")
                     previous_var = feat_var
 
+            elif feat_type == "bayonet_groove":
+                # Swept-cut bayonet channels wrapped on the neck cylinder wall.
+                # Recorded here and realised as a doc-level Part::Cut once the
+                # body has been recomputed (raw Part shapes cannot be cut into
+                # a live PartDesign tip mid-tree).
+                bayonet_cuts.append((body_var, feat_name, feat))
+
             else:
                 lines.append(
                     f"# WARNING: Unknown feature type '{feat_type}' "
@@ -667,6 +720,70 @@ def _gen_bodies(project: dict) -> List[str]:
                 )
 
             lines.append("")
+
+    if bayonet_cuts:
+        lines.append("doc.recompute()")
+        lines.append("")
+    for cut_index, (body_var, feat_name, feat) in enumerate(bayonet_cuts, start=1):
+        props = feat.get("properties", {})
+
+        def _p(key, default):
+            value = feat.get(key, props.get(key, default))
+            return default if value is None else value
+
+        cx = float(_p("center_x", 0.0))
+        cy = float(_p("center_y", 0.0))
+        r_outer = float(_p("wall_radius", 6.2))
+        depth = float(_p("depth", 0.9))
+        half_width = float(_p("half_width", 6.0))
+        over = float(_p("overcut", 0.5))
+        symmetry = int(_p("symmetry", 2))
+        channels = feat.get("channels", props.get("channels"))
+        base_segments = feat.get("segments", props.get("segments", []))
+
+        # Exploit the measured n-fold symmetry: one channel is described, the
+        # rest are angular copies at 360/symmetry spacing (unless explicit
+        # per-channel segment lists are supplied).
+        channel_specs: List[Any]
+        if channels:
+            channel_specs = list(channels)
+        else:
+            channel_specs = []
+            step = 360.0 / max(symmetry, 1)
+            for copy_index in range(max(symmetry, 1)):
+                rotated = []
+                for seg in base_segments:
+                    seg = dict(seg)
+                    offset = step * copy_index
+                    if seg.get("kind", "circumferential") == "circumferential":
+                        seg["angle0"] = float(seg.get("angle0", 0.0)) + offset
+                        seg["angle1"] = float(seg.get("angle1", 0.0)) + offset
+                    else:
+                        seg["angle"] = float(seg.get("angle", 0.0)) + offset
+                    rotated.append(seg)
+                channel_specs.append(rotated)
+
+        tool_var = f"bayonet_tool_{cut_index}"
+        lines.append(f"{tool_var}_pieces = []")
+        for chan_index, segments in enumerate(channel_specs):
+            lines.append(
+                f"{tool_var}_chan = _bayonet_channel_solid("
+                f"{cx}, {cy}, {r_outer}, {depth}, {half_width}, {over}, {segments!r})"
+            )
+            lines.append(f"if {tool_var}_chan is not None:")
+            lines.append(f"    {tool_var}_pieces.append({tool_var}_chan)")
+        lines.append(f"if {tool_var}_pieces:")
+        lines.append(f"    {tool_var}_shape = {tool_var}_pieces[0]")
+        lines.append(f"    for _extra in {tool_var}_pieces[1:]:")
+        lines.append(f"        {tool_var}_shape = {tool_var}_shape.fuse(_extra)")
+        lines.append(f"    {tool_var} = doc.addObject('Part::Feature', '{_safe_name(feat_name)}_tool')")
+        lines.append(f"    {tool_var}.Shape = {tool_var}_shape")
+        lines.append(f"    {tool_var}.Visibility = False")
+        cut_var = f"obj_{_safe_name(feat_name)}"
+        lines.append(f"    {cut_var} = doc.addObject('Part::Cut', '{_safe_name(feat_name)}')")
+        lines.append(f"    {cut_var}.Base = {body_var}")
+        lines.append(f"    {cut_var}.Tool = {tool_var}")
+        lines.append("")
 
     return lines
 
