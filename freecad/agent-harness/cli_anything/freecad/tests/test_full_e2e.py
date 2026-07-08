@@ -785,6 +785,55 @@ class TestFreeCADBackend:
         print(f"\n  off-origin sector bite: {removed:.2f} mm^3 "
               f"(none={volumes['none']:.1f}, groove={volumes['groove']:.1f})")
 
+    def test_loft_segment_cuts_tapering_wedge_off_origin(self, tmp_path):
+        """Regression for the FreeCAD-STL-Importer s20 case: the scan shows no
+        staircase steps in the bayonet groove, so a 'loft' segment must cut a
+        continuously tapering wedge between two measured bands (rather than
+        the discrete per-band sector stack from s18/s19). The angular sweep
+        narrows from 88 deg at z=9.0 to 32 deg at z=12.0 while the wall/depth
+        stay fixed, so the removed volume should sit near a ring sector
+        integrated over a linearly-shrinking sweep.
+        """
+
+        def neck_project(name: str, with_groove: bool) -> dict:
+            proj = create_document(name=name)
+            create_body(proj)
+            additive_cylinder(proj, body_index=0, radius=6.236, height=7.87,
+                              position=[7.2, 7.15, 8.17])
+            if with_groove:
+                segments = [
+                    {
+                        "kind": "loft", "z0": 9.0, "z1": 12.0,
+                        "bottom": {"angle0": 69.0, "angle1": 157.0,
+                                   "wall_radius": 6.23, "depth": 0.95},
+                        "top": {"angle0": 119.0, "angle1": 151.0,
+                                "wall_radius": 6.23, "depth": 0.95},
+                    },
+                ]
+                bayonet_groove(proj, body_index=0, segments=segments,
+                               wall_radius=6.256, depth=0.9,
+                               center_x=7.2, center_y=7.15, symmetry=1)
+            return proj
+
+        volumes = {}
+        for label, with_groove in (("none", False), ("wedge", True)):
+            proj = neck_project(f"LoftWedgeNeck_{label}", with_groove)
+            output = str(tmp_path / f"neck_{label}.stl")
+            export_project(proj, output, preset="stl")
+            volumes[label] = _stl_mesh_volume(output)
+
+        # analytical expectation: sweep narrows linearly from 88 deg (z=9.0)
+        # to 32 deg (z=12.0), mean sweep ~60 deg, ring 5.28..6.236 in the
+        # material, 3.0 mm tall -> (60/360) * pi * (6.236^2 - 5.28^2) * 3.0
+        # ~= 17.3 mm^3, plus a small overcut sliver.
+        removed = volumes["none"] - volumes["wedge"]
+        assert 14.0 < removed < 22.0, (
+            f"expected the loft wedge to remove ~17.3 mm^3 from the "
+            f"off-origin neck, got {removed:.2f} mm^3 (volumes: {volumes})"
+        )
+        print(f"\n  loft wedge bite: {removed:.2f} mm^3 "
+              f"(none={volumes['none']:.1f}, wedge={volumes['wedge']:.1f})")
+
     @pytest.mark.skipif(not _has_freecad_preview(), reason="GUI-capable FreeCAD not installed")
     def test_preview_capture_bundle(self, tmp_path):
         proj = create_document(name="PreviewPart")
