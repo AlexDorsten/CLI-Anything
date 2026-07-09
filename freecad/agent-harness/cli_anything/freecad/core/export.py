@@ -256,6 +256,7 @@ def export_project(
     output_path: str,
     preset: str = "step",
     overwrite: bool = False,
+    timeout: int = 600,
 ) -> Dict[str, Any]:
     """Export a FreeCAD project to a CAD/mesh file.
 
@@ -274,6 +275,12 @@ def export_project(
     overwrite : bool
         If *False* (default), raise ``FileExistsError`` when *output_path*
         already exists.
+    timeout : int
+        Seconds allowed for the headless FreeCAD export macro (default 600).
+        A project whose document history has many small doc-level operations
+        (e.g. per-band section lofts) can take noticeably longer than a
+        simple project to recompute and save; raise this rather than the
+        export failing with a misleadingly generic timeout error.
 
     Returns
     -------
@@ -315,7 +322,7 @@ def export_project(
 
     # Execute via the headless backend
     result = freecad_backend.export_headless(
-        macro_content, output_path, timeout=120,
+        macro_content, output_path, timeout=timeout,
     )
 
     # Verify the output file
