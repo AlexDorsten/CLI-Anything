@@ -1108,6 +1108,63 @@ print("RESULT_JSON:" + json.dumps(result))
                 sections=[{"z": 2.0, "points": good}, {"z": 4.0, "points": good}],
             )
 
+    def test_doc_level_booleans_are_finalized_per_op(self, tmp_path):
+        """Neck-fit campaign it.3: every doc-level Part::Fuse/Part::Cut in
+        the generated macro must be recomputed and validated on its OWN,
+        immediately after it is wired up, instead of being deferred to a
+        single final ``doc.recompute()``. Otherwise a BOPAlgo failure leaves
+        a NULL shape mid-recompute that is silently handed to the next op's
+        Base and only surfaces as a missing export file, with no indication
+        of which boolean died. The macro must therefore emit a
+        ``_finalize_op`` helper that raises a hard, named error on a
+        NULL/invalid result, and call it once for each doc-level boolean.
+        """
+        cx, cy = 7.0, 5.0
+        proj = create_document(name="FinalizeChain")
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10.0, width=10.0, height=2.0,
+                     position=[cx - 5.0, cy - 5.0, 0.0])
+        additive_section_loft(
+            proj, body_index=0, ruled=True,
+            sections=[
+                {"z": 2.0, "points": self._square_loft_points(cx, cy, 5.0)},
+                {"z": 4.0, "points": self._square_loft_points(cx, cy, 4.0)},
+                {"z": 6.0, "points": self._square_loft_points(cx, cy, 5.0)},
+            ],
+        )
+        subtractive_section_loft(
+            proj, body_index=0, ruled=True,
+            sections=[
+                {"z": 3.0, "points": self._square_loft_points(cx, cy, 2.0)},
+                {"z": 4.0, "points": self._square_loft_points(cx, cy, 1.5)},
+                {"z": 5.0, "points": self._square_loft_points(cx, cy, 2.0)},
+            ],
+        )
+
+        macro = generate_macro(proj, str(tmp_path / "chain.FCStd"),
+                               export_format="fcstd")
+
+        # the helper and its two hard, named failure modes are emitted once
+        assert "def _finalize_op(op, label):" in macro
+        assert "doc.recompute([op])" in macro
+        assert "produced a NULL shape" in macro
+        assert "produced an INVALID shape" in macro
+
+        # exactly one _finalize_op CALL per doc-level boolean (the additive
+        # fuse and the subtractive cut here), never a silent unfinalized op
+        doc_level_ops = (
+            macro.count("addObject('Part::Fuse'")
+            + macro.count("addObject('Part::Cut'")
+        )
+        assert doc_level_ops >= 2, (
+            f"expected the fuse+cut doc-level ops, found {doc_level_ops}"
+        )
+        finalize_calls = macro.count("_finalize_op(") - 1  # minus the def line
+        assert finalize_calls == doc_level_ops, (
+            f"every doc-level boolean must be finalized: {doc_level_ops} ops "
+            f"but {finalize_calls} _finalize_op calls"
+        )
+
     def test_subtractive_section_loft_matches_frustum_stack_off_origin(self, tmp_path):
         """Regression for the FreeCAD-STL-Importer volume campaign iteration
         3 (cutting the adapter's main cavity from measured inner-contour

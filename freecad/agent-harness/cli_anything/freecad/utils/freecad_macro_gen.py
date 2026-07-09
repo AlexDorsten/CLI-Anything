@@ -1573,6 +1573,34 @@ def _gen_bodies(project: dict) -> List[str]:
     ):
         lines.append("doc.recompute()")
         lines.append("")
+        # Harden the doc-level boolean chain (neck-fit campaign it.3). Each
+        # Part::Fuse/Part::Cut below is recomputed on its OWN, immediately
+        # after it is wired up, rather than deferring every boolean to one
+        # giant final doc.recompute():
+        #   (b) a BOPAlgo failure is localized to the exact op that produced
+        #       it (the traceback names the feature) and peak memory stays
+        #       bounded to a single boolean instead of the whole chain -- the
+        #       previous behaviour silently left a NULL shape mid-recompute
+        #       and only surfaced as a missing FCStd export file.
+        #   (c) the op's result is validated (isNull / isValid) and a hard,
+        #       named RuntimeError is raised instead of handing a NULL/invalid
+        #       shape to the next op's Base (which would smear the failure
+        #       downstream and lose the culprit).
+        lines.append("def _finalize_op(op, label):")
+        lines.append("    doc.recompute([op])")
+        lines.append("    shape = getattr(op, 'Shape', None)")
+        lines.append("    if shape is None or shape.isNull():")
+        lines.append(
+            "        raise RuntimeError("
+            "'doc-level boolean produced a NULL shape: %s [%s]' % (label, op.Name))"
+        )
+        lines.append("    if not shape.isValid():")
+        lines.append(
+            "        raise RuntimeError("
+            "'doc-level boolean produced an INVALID shape: %s [%s]' % (label, op.Name))"
+        )
+        lines.append("    return op")
+        lines.append("")
 
     # Track the current top-level result per body across these doc-level
     # ops. additive_section_loft fusions are emitted first (below), then all
@@ -1612,6 +1640,7 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"{fuse_var} = doc.addObject('Part::Fuse', '{safe_feat_name}')")
         lines.append(f"{fuse_var}.Base = {_current_var(body_var)}")
         lines.append(f"{fuse_var}.Tool = {loft_var}")
+        lines.append(f"_finalize_op({fuse_var}, {feat_name!r})")
         lines.append("")
         body_current[body_var] = fuse_var
 
@@ -1650,6 +1679,7 @@ def _gen_bodies(project: dict) -> List[str]:
             )
             lines.append(f"{recut_var}.Base = {fuse_var}")
             lines.append(f"{recut_var}.Tool = {redrill_var}_tool")
+            lines.append(f"_finalize_op({recut_var}, {feat_name + '_redrilled'!r})")
             lines.append("")
             body_current[body_var] = recut_var
 
@@ -1719,6 +1749,7 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"    {cut_var} = doc.addObject('Part::Cut', '{_safe_name(feat_name)}')")
         lines.append(f"    {cut_var}.Base = {_current_var(body_var)}")
         lines.append(f"    {cut_var}.Tool = {tool_var}")
+        lines.append(f"    _finalize_op({cut_var}, {feat_name!r})")
         lines.append("")
         body_current[body_var] = cut_var
 
@@ -1755,6 +1786,7 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"{cut_var} = doc.addObject('Part::Cut', '{safe_feat_name}')")
         lines.append(f"{cut_var}.Base = {_current_var(body_var)}")
         lines.append(f"{cut_var}.Tool = {loft_var}")
+        lines.append(f"_finalize_op({cut_var}, {feat_name!r})")
         lines.append("")
         body_current[body_var] = cut_var
 
@@ -1801,6 +1833,7 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"{op_var} = doc.addObject('{op_class}', '{safe_feat_name}')")
         lines.append(f"{op_var}.Base = {_current_var(body_var)}")
         lines.append(f"{op_var}.Tool = {loft_var}")
+        lines.append(f"_finalize_op({op_var}, {feat_name!r})")
         lines.append("")
         body_current[body_var] = op_var
 
