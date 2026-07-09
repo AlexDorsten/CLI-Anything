@@ -570,8 +570,15 @@ def _gen_bodies(project: dict) -> List[str]:
     # body's result is at that point -- otherwise the island would be added
     # to the not-yet-hollowed body and then erased wholesale by the cavity
     # cut that runs afterward.
-    deferred_section_lofts: List[tuple[str, str, Dict[str, Any]]] = []
-    deferred_subtractive_lofts: List[tuple[str, str, Dict[str, Any]]] = []
+    #
+    # One shared list, in FEATURE ORDER, tagged "fuse"/"cut" -- NOT two
+    # phase-separated lists like the normal fuse/cut phases above. The
+    # deferred ops encode explicit restore chains (restore the socket tube,
+    # re-drill its bore, restore the core pin standing inside that bore);
+    # batching all deferred fuses before all deferred cuts would let the
+    # re-drilled bore hollow back out any island fused inside its own
+    # footprint (volume campaign iteration 5: the socket core pin).
+    deferred_ops: List[tuple[str, str, str, Dict[str, Any]]] = []
 
     for body in bodies:
         body_name = _safe_name(body.get("name", "Body"))
@@ -810,7 +817,7 @@ def _gen_bodies(project: dict) -> List[str]:
                 # a live PartDesign tip mid-tree). after_cuts defers it to
                 # run after the normal fuse/cut phases (see collection above).
                 if feat.get("after_cuts"):
-                    deferred_section_lofts.append((body_var, feat_name, feat))
+                    deferred_ops.append(("fuse", body_var, feat_name, feat))
                 else:
                     section_lofts.append((body_var, feat_name, feat))
 
@@ -821,7 +828,7 @@ def _gen_bodies(project: dict) -> List[str]:
                 # been recomputed, chained after any additive fusion on the
                 # same body (see the emission loop below).
                 if feat.get("after_cuts"):
-                    deferred_subtractive_lofts.append((body_var, feat_name, feat))
+                    deferred_ops.append(("cut", body_var, feat_name, feat))
                 else:
                     subtractive_section_lofts.append((body_var, feat_name, feat))
 
@@ -837,8 +844,7 @@ def _gen_bodies(project: dict) -> List[str]:
         bayonet_cuts
         or section_lofts
         or subtractive_section_lofts
-        or deferred_section_lofts
-        or deferred_subtractive_lofts
+        or deferred_ops
     ):
         lines.append("doc.recompute()")
         lines.append("")
@@ -869,7 +875,14 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"{loft_var}.Shape = {loft_var}_shape")
         lines.append(f"{loft_var}.Visibility = False")
 
-        fuse_var = f"obj_{safe_feat_name}"
+        # the Python variable must be unique per emitted op: features of the
+        # same type share a default display name, and reusing plain
+        # `obj_<name>` across loop iterations rebinds the variable BEFORE
+        # the next iteration's `.Base = <current>` line reads it back --
+        # producing a fatal self-referencing Base ("the graph must be a
+        # DAG", null downstream shapes). FreeCAD's document namespace
+        # de-duplicates the display names on its own.
+        fuse_var = f"obj_{safe_feat_name}_fuse{loft_index}"
         lines.append(f"{fuse_var} = doc.addObject('Part::Fuse', '{safe_feat_name}')")
         lines.append(f"{fuse_var}.Base = {_current_var(body_var)}")
         lines.append(f"{fuse_var}.Tool = {loft_var}")
@@ -969,7 +982,8 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"    {tool_var} = doc.addObject('Part::Feature', '{_safe_name(feat_name)}_tool')")
         lines.append(f"    {tool_var}.Shape = {tool_var}_shape")
         lines.append(f"    {tool_var}.Visibility = False")
-        cut_var = f"obj_{_safe_name(feat_name)}"
+        # unique Python variable per op (see the section_lofts loop above)
+        cut_var = f"obj_{_safe_name(feat_name)}_bayonet{cut_index}"
         lines.append(f"    {cut_var} = doc.addObject('Part::Cut', '{_safe_name(feat_name)}')")
         lines.append(f"    {cut_var}.Base = {_current_var(body_var)}")
         lines.append(f"    {cut_var}.Tool = {tool_var}")
@@ -987,7 +1001,8 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"{loft_var}.Shape = {loft_var}_shape")
         lines.append(f"{loft_var}.Visibility = False")
 
-        cut_var = f"obj_{safe_feat_name}"
+        # unique Python variable per op (see the section_lofts loop above)
+        cut_var = f"obj_{safe_feat_name}_cut{loft_index}"
         lines.append(f"{cut_var} = doc.addObject('Part::Cut', '{safe_feat_name}')")
         lines.append(f"{cut_var}.Base = {_current_var(body_var)}")
         lines.append(f"{cut_var}.Tool = {loft_var}")
@@ -997,43 +1012,42 @@ def _gen_bodies(project: dict) -> List[str]:
     # after_cuts phase: islands that must be added back (and, for a bore,
     # re-drilled) AFTER the cavity cuts above have already run -- e.g. a
     # socket tube rebuilt inside a chamber that is itself cut doc-level now,
-    # instead of in-tree before the socket used to be added. Fuses first,
-    # then cuts, exactly mirroring the normal phases, just later in time.
-    for loft_index, (body_var, feat_name, feat) in enumerate(deferred_section_lofts, start=1):
+    # instead of in-tree before the socket used to be added. Ops run in
+    # FEATURE ORDER (fuses and cuts interleaved), NOT fuses-then-cuts like
+    # the normal phases: the deferred ops encode explicit restore chains
+    # (restore the socket tube, re-drill its bore, restore the core pin
+    # standing inside that bore), and batching all fuses first would let
+    # the re-drilled bore hollow back out any island fused inside its own
+    # footprint (volume campaign iteration 5: the socket core pin).
+    fuse_count = 0
+    cut_count = 0
+    for kind, body_var, feat_name, feat in deferred_ops:
         sections = feat.get("sections", [])
         ruled = bool(feat.get("ruled", True))
         safe_feat_name = _safe_name(feat_name)
 
-        loft_var = f"post_cut_section_loft_{loft_index}"
+        if kind == "fuse":
+            fuse_count += 1
+            loft_var = f"post_cut_section_loft_{fuse_count}"
+            # unique Python variable per op (see the section_lofts loop above)
+            op_var = f"obj_{safe_feat_name}_postfuse{fuse_count}"
+            op_class = "Part::Fuse"
+        else:
+            cut_count += 1
+            loft_var = f"post_cut_subtractive_loft_{cut_count}"
+            # unique Python variable per op (see the section_lofts loop above)
+            op_var = f"obj_{safe_feat_name}_postcut{cut_count}"
+            op_class = "Part::Cut"
+
         lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
         lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
         lines.append(f"{loft_var}.Shape = {loft_var}_shape")
         lines.append(f"{loft_var}.Visibility = False")
-
-        fuse_var = f"obj_{safe_feat_name}"
-        lines.append(f"{fuse_var} = doc.addObject('Part::Fuse', '{safe_feat_name}')")
-        lines.append(f"{fuse_var}.Base = {_current_var(body_var)}")
-        lines.append(f"{fuse_var}.Tool = {loft_var}")
+        lines.append(f"{op_var} = doc.addObject('{op_class}', '{safe_feat_name}')")
+        lines.append(f"{op_var}.Base = {_current_var(body_var)}")
+        lines.append(f"{op_var}.Tool = {loft_var}")
         lines.append("")
-        body_current[body_var] = fuse_var
-
-    for loft_index, (body_var, feat_name, feat) in enumerate(deferred_subtractive_lofts, start=1):
-        sections = feat.get("sections", [])
-        ruled = bool(feat.get("ruled", True))
-        safe_feat_name = _safe_name(feat_name)
-
-        loft_var = f"post_cut_subtractive_loft_{loft_index}"
-        lines.append(f"{loft_var}_shape = _section_loft_solid({sections!r}, {ruled!r})")
-        lines.append(f"{loft_var} = doc.addObject('Part::Feature', '{safe_feat_name}_loft')")
-        lines.append(f"{loft_var}.Shape = {loft_var}_shape")
-        lines.append(f"{loft_var}.Visibility = False")
-
-        cut_var = f"obj_{safe_feat_name}"
-        lines.append(f"{cut_var} = doc.addObject('Part::Cut', '{safe_feat_name}')")
-        lines.append(f"{cut_var}.Base = {_current_var(body_var)}")
-        lines.append(f"{cut_var}.Tool = {loft_var}")
-        lines.append("")
-        body_current[body_var] = cut_var
+        body_current[body_var] = op_var
 
     return lines
 

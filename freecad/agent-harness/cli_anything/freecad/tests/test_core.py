@@ -859,12 +859,12 @@ class TestBody:
         assert "def _section_loft_solid(" in macro
         assert "section_loft_1_shape = _section_loft_solid(" in macro
         assert "doc.addObject('Part::Fuse', 'Lid')" in macro
-        assert "obj_Lid.Base = body_MainBody" in macro
-        assert "obj_Lid.Tool = section_loft_1" in macro
+        assert "obj_Lid_fuse1.Base = body_MainBody" in macro
+        assert "obj_Lid_fuse1.Tool = section_loft_1" in macro
         # the redrill hole is re-cut doc-level after the fuse
         assert "Part.makeCylinder(0.5, 3.0, FreeCAD.Vector(2.5, 2.5, 0.0)" in macro
         assert "doc.addObject('Part::Cut', 'Lid_redrilled')" in macro
-        assert "obj_Lid_redrilled.Base = obj_Lid" in macro
+        assert "obj_Lid_fuse1_redrilled.Base = obj_Lid_fuse1" in macro
 
     def test_subtractive_section_loft_feature_recorded(self):
         proj = {"bodies": [], "sketches": [], "parts": []}
@@ -957,8 +957,8 @@ class TestBody:
         assert "def _section_loft_solid(" in macro
         assert "subtractive_section_loft_1_shape = _section_loft_solid(" in macro
         assert "doc.addObject('Part::Cut', 'Cavity')" in macro
-        assert "obj_Cavity.Base = body_MainBody" in macro
-        assert "obj_Cavity.Tool = subtractive_section_loft_1" in macro
+        assert "obj_Cavity_cut1.Base = body_MainBody" in macro
+        assert "obj_Cavity_cut1.Tool = subtractive_section_loft_1" in macro
 
     def test_macro_chains_subtractive_cut_after_additive_fusion_on_same_body(self):
         """Regression for the volume campaign iteration 3 doc-level ordering
@@ -1012,10 +1012,10 @@ class TestBody:
         macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
 
         # the additive fusion still starts from the raw body ...
-        assert "obj_Rim.Base = body_MainBody" in macro
+        assert "obj_Rim_fuse1.Base = body_MainBody" in macro
         # ... but the subtractive cut chains onto the fused result, not the
         # raw body, so the final top-level shape includes both operations
-        assert "obj_Cavity.Base = obj_Rim" in macro
+        assert "obj_Cavity_cut1.Base = obj_Rim_fuse1" in macro
 
     def test_after_cuts_fuse_and_cut_run_after_the_normal_phases(self):
         """Regression for the volume campaign iteration 3 cut-then-restore
@@ -1082,14 +1082,139 @@ class TestBody:
         macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
 
         # the cavity cut chains onto the raw body (nothing ran before it)
-        assert "obj_Cavity.Base = body_MainBody" in macro
+        assert "obj_Cavity_cut1.Base = body_MainBody" in macro
         # the deferred socket-ring fuse chains onto the cavity cut's result
-        assert "obj_SocketRing.Base = obj_Cavity" in macro
+        assert "obj_SocketRing_postfuse1.Base = obj_Cavity_cut1" in macro
         # the deferred socket-bore cut chains onto the socket-ring fuse
-        assert "obj_SocketBore.Base = obj_SocketRing" in macro
+        assert "obj_SocketBore_postcut1.Base = obj_SocketRing_postfuse1" in macro
         # deferred fuses/cuts use their own loft variable namespace
         assert "post_cut_section_loft_1_shape = _section_loft_solid(" in macro
         assert "post_cut_subtractive_loft_1_shape = _section_loft_solid(" in macro
+
+    def test_same_named_deferred_lofts_chain_without_self_reference(self):
+        """Regression for the volume campaign iteration 5 DAG failure: several
+        deferred (after_cuts) additive_section_loft features sharing one
+        default display name used to reuse one Python variable, so from the
+        second op on the emitted `.Base = obj_<name>` line read back the
+        variable the line right above it had just rebound -- a fatal
+        self-referencing Base ("the graph must be a DAG", every downstream
+        shape null, no FCStd written). Each emitted op must get a unique
+        Python variable, and each op's Base must reference the previous op's
+        variable, never its own."""
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        sections = [
+            {"z": 1.0, "points": [[0, 0], [1, 0], [1, 1], [0, 1]]},
+            {"z": 2.0, "points": [[0, 0], [1, 0], [1, 1], [0, 1]]},
+        ]
+        features = [
+            {
+                "id": 1,
+                "type": "additive_box",
+                "name": "BasePlate",
+                "length": 10.0, "width": 10.0, "height": 10.0,
+            },
+        ]
+        for index in range(3):
+            features.append(
+                {
+                    "id": 2 + index,
+                    "type": "additive_section_loft",
+                    "name": "Feature_additive_section_loft",
+                    "ruled": True,
+                    "after_cuts": True,
+                    "sections": sections,
+                }
+            )
+        project = {
+            "name": "same-named-deferred-lofts",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [{"id": 1, "name": "MainBody", "features": features}],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        for line in macro.splitlines():
+            stripped = line.strip()
+            if ".Base = " not in stripped:
+                continue
+            target, _, source = stripped.partition(".Base = ")
+            assert target != source, f"self-referencing Base: {stripped}"
+        # the three deferred fuses chain sequentially onto each other
+        assert "obj_Feature_additive_section_loft_postfuse1.Base = body_MainBody" in macro
+        assert (
+            "obj_Feature_additive_section_loft_postfuse2.Base = "
+            "obj_Feature_additive_section_loft_postfuse1" in macro
+        )
+        assert (
+            "obj_Feature_additive_section_loft_postfuse3.Base = "
+            "obj_Feature_additive_section_loft_postfuse2" in macro
+        )
+
+    def test_deferred_ops_run_in_feature_order_not_fuses_then_cuts(self):
+        """Regression for the volume campaign iteration 5 core-pin loss: the
+        deferred (after_cuts) phase must run its ops in FEATURE ORDER, not
+        all fuses before all cuts. The deferred ops encode explicit restore
+        chains -- restore the socket tube, re-drill its bore, restore the
+        slim core pin standing inside that bore. Batching the pin's fuse
+        before the bore's cut lets the bore hollow the pin right back out;
+        in feature order the pin is fused onto the already-drilled result
+        and survives."""
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        ring = [
+            {"z": 1.0, "points": [[0, 0], [4, 0], [4, 4], [0, 4]]},
+            {"z": 5.0, "points": [[0, 0], [4, 0], [4, 4], [0, 4]]},
+        ]
+        bore = [
+            {"z": 1.0, "points": [[1, 1], [3, 1], [3, 3], [1, 3]]},
+            {"z": 5.0, "points": [[1, 1], [3, 1], [3, 3], [1, 3]]},
+        ]
+        pin = [
+            {"z": 1.0, "points": [[1.8, 1.8], [2.2, 1.8], [2.2, 2.2], [1.8, 2.2]]},
+            {"z": 5.0, "points": [[1.8, 1.8], [2.2, 1.8], [2.2, 2.2], [1.8, 2.2]]},
+        ]
+        project = {
+            "name": "restore-chain-order",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "MainBody",
+                    "features": [
+                        {
+                            "id": 1,
+                            "type": "additive_box",
+                            "name": "BasePlate",
+                            "length": 10.0, "width": 10.0, "height": 10.0,
+                        },
+                        {
+                            "id": 2, "type": "additive_section_loft", "name": "Ring",
+                            "ruled": True, "after_cuts": True, "sections": ring,
+                        },
+                        {
+                            "id": 3, "type": "subtractive_section_loft", "name": "Bore",
+                            "ruled": True, "after_cuts": True, "sections": bore,
+                        },
+                        {
+                            "id": 4, "type": "additive_section_loft", "name": "Pin",
+                            "ruled": True, "after_cuts": True, "sections": pin,
+                        },
+                    ],
+                }
+            ],
+        }
+
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+
+        # feature order preserved: ring fuse -> bore cut -> pin fuse
+        assert "obj_Ring_postfuse1.Base = body_MainBody" in macro
+        assert "obj_Bore_postcut1.Base = obj_Ring_postfuse1" in macro
+        assert "obj_Pin_postfuse2.Base = obj_Bore_postcut1" in macro
+        # the wrong (old) order would have chained the pin before the bore
+        assert "obj_Pin_postfuse2.Base = obj_Ring_postfuse1" not in macro
 
     def test_top_rim_selector_accepted_and_bound(self):
         # top_rim is a valid semantic selector (mirror of bottom_rim at ZMax);
