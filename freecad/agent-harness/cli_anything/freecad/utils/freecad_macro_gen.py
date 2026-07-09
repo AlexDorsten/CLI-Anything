@@ -8,6 +8,7 @@ create geometry and export to various CAD/mesh formats.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Dict, List, Optional
 
@@ -522,6 +523,401 @@ def _emit_rect_profile_sketch(
     return sketch_var
 
 
+# ---------------------------------------------------------------------------
+# Designer-tree Phase 2: band-level datum planes + construction reference
+# sketches for outline-stack pads, section-loft bands and bayonet channels.
+#
+# None of the helpers below change any solid's geometry: a datum plane
+# attached to the body's XY_Plane with an AttachmentOffset reproduces the
+# exact same global placement the old raw-Placement sketches used (see
+# _emit_profile_sketch), and the reference sketches they carry are pure
+# construction geometry with non-driving (Reference) dimensions -- inert
+# w.r.t. the body's Tip/Shape, so they can be added to a body at any point,
+# including after that body's Tip has already been hijacked by a doc-level
+# Part::Cut/Fuse for a bayonet groove or section loft.
+# ---------------------------------------------------------------------------
+
+
+_BAND_OUTLINE_NAME_RE = re.compile(r"^BaseOutline(?:Band(\d+))?$")
+
+
+def _band_outline_index(sketch_name: str) -> Optional[int]:
+    """Return the 1-based band number for a padded_outline_stack sketch name
+    ("BaseOutline" -> 1, "BaseOutlineBand2" -> 2, ...), or None if the name
+    does not match that stack's naming convention.
+    """
+    match = _BAND_OUTLINE_NAME_RE.match(sketch_name)
+    if not match:
+        return None
+    return 1 if match.group(1) is None else int(match.group(1))
+
+
+def _polygon_reference_stats(points: List[Any]) -> tuple[float, float, float, float]:
+    """Return (centroid_x, centroid_y, bbox_length, bbox_width) for a band's
+    polygon vertices -- used to label a construction reference sketch.
+    """
+    xs = [float(p[0]) for p in points]
+    ys = [float(p[1]) for p in points]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    length = max(xs) - min(xs)
+    width = max(ys) - min(ys)
+    return cx, cy, length, width
+
+
+def _emit_band_datum_plane(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    suffix: str,
+    label_stem: str,
+    z: float,
+) -> str:
+    """Emit a named datum plane offset from the body's XY plane by *z*, for
+    band-level documentation (Designer-tree Phase 2). Same construction as
+    the Phase 1 ``_emit_datum_plane``, but keyed by a caller-supplied
+    *suffix* string instead of a shared feature counter, so multiple bands
+    realised outside the per-feature loop (section lofts, bayonet channels)
+    get unique, collision-free Python variable names.
+    """
+    dp_var = f"dp_{body_name}_{suffix}"
+    dp_label = _safe_name(f"DP_{label_stem}_z{_z_token(z)}")
+    lines.append(f"{dp_var} = {body_var}.newObject('PartDesign::Plane', '{dp_label}')")
+    lines.append(
+        f"{dp_var}.AttachmentSupport = [(_body_origin_ref({body_var}, 'XY_Plane'), '')]"
+    )
+    lines.append(f"{dp_var}.MapMode = 'FlatFace'")
+    lines.append(
+        f"{dp_var}.AttachmentOffset = FreeCAD.Placement("
+        f"FreeCAD.Vector(0, 0, {z}), FreeCAD.Rotation())"
+    )
+    return dp_var
+
+
+def _emit_band_reference_sketch(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    suffix: str,
+    label_stem: str,
+    dp_var: str,
+    points: List[Any],
+) -> str:
+    """Emit a construction-only reference sketch on a band's datum plane: a
+    crosshair through the band's centroid plus non-driving DistanceX/
+    DistanceY dimensions recording its bounding-box length/width. Pure
+    documentation -- never consumed by a Pad/Pocket/loft.
+    """
+    cx, cy, length, width = _polygon_reference_stats(points)
+    half_l = max(length, 1e-3) / 2.0
+    half_w = max(width, 1e-3) / 2.0
+    sketch_var = f"sketch_{body_name}_{suffix}_ref"
+    sketch_label = _safe_name(f"Sketch_{label_stem}_ref")
+    lines.append(f"{sketch_var} = {body_var}.newObject('Sketcher::SketchObject', '{sketch_label}')")
+    lines.append(f"{sketch_var}.AttachmentSupport = [({dp_var}, '')]")
+    lines.append(f"{sketch_var}.MapMode = 'FlatFace'")
+    g0 = f"{sketch_var}_g0"
+    g1 = f"{sketch_var}_g1"
+    lines.append(
+        f"{g0} = {sketch_var}.addGeometry(Part.LineSegment("
+        f"FreeCAD.Vector({cx - half_l}, {cy}, 0), FreeCAD.Vector({cx + half_l}, {cy}, 0)), True)"
+    )
+    lines.append(
+        f"{g1} = {sketch_var}.addGeometry(Part.LineSegment("
+        f"FreeCAD.Vector({cx}, {cy - half_w}, 0), FreeCAD.Vector({cx}, {cy + half_w}, 0)), True)"
+    )
+    c0 = f"{sketch_var}_c0"
+    c1 = f"{sketch_var}_c1"
+    lines.append(
+        f"{c0} = {sketch_var}.addConstraint(Sketcher.Constraint("
+        f"'DistanceX', {g0}, 1, {g0}, 2, {length}))"
+    )
+    lines.append(f"{sketch_var}.setDriving({c0}, False)")
+    lines.append(
+        f"{c1} = {sketch_var}.addConstraint(Sketcher.Constraint("
+        f"'DistanceY', {g1}, 1, {g1}, 2, {width}))"
+    )
+    lines.append(f"{sketch_var}.setDriving({c1}, False)")
+    lines.append(f"{sketch_var}.Visibility = False")
+    return sketch_var
+
+
+def _emit_band_outline_sketch(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    feature_counter: int,
+    band_num: int,
+    sketch: Dict[str, Any],
+    sketch_var: str,
+) -> bool:
+    """Emit a padded_outline_stack band's profile sketch attached to a named
+    band datum plane instead of a raw Placement offset (task a). The
+    polygon geometry emitted is byte-for-byte identical to the old
+    ``_emit_profile_sketch`` path -- for an XY-plane sketch (the only plane
+    padded_outline_stack ever uses) a datum plane attached to the body's
+    XY_Plane with AttachmentOffset (0, 0, z) resolves to exactly the same
+    global placement (0, 0, z) / identity rotation that the raw Placement
+    used, so the resulting Pad is the same solid; only the tree structure
+    (and a new construction reference sketch recording the band's measured
+    bbox) changes.
+    """
+    elements = sketch.get("elements", [])
+    supported = [
+        element
+        for element in elements
+        if isinstance(element, dict) and element.get("type") in {"line", "circle"}
+    ]
+    if not supported:
+        return False
+
+    z = float(sketch.get("offset", 0.0))
+    label_stem = f"BaseOutlineStack_band{band_num}"
+    suffix = f"{feature_counter}_band{band_num}"
+    dp_var = _emit_band_datum_plane(lines, body_var, body_name, suffix, label_stem, z)
+
+    outline_points = [
+        element.get("start", [0.0, 0.0])
+        for element in supported
+        if element.get("type") == "line"
+    ]
+    if len(outline_points) >= 3:
+        _emit_band_reference_sketch(lines, body_var, body_name, suffix, label_stem, dp_var, outline_points)
+
+    sketch_name = _safe_name(sketch.get("name", "ProfileSketch"))
+    lines.append(f"{sketch_var} = {body_var}.newObject('Sketcher::SketchObject', '{sketch_name}')")
+    lines.append(f"{sketch_var}.AttachmentSupport = [({dp_var}, '')]")
+    lines.append(f"{sketch_var}.MapMode = 'FlatFace'")
+    for element in elements:
+        element_type = element.get("type") if isinstance(element, dict) else None
+        if element_type == "line":
+            start = element.get("start", [0.0, 0.0])
+            end = element.get("end", [0.0, 0.0])
+            lines.append(
+                f"{sketch_var}.addGeometry(Part.LineSegment("
+                f"FreeCAD.Vector({float(start[0])}, {float(start[1])}, 0), "
+                f"FreeCAD.Vector({float(end[0])}, {float(end[1])}, 0)), False)"
+            )
+        elif element_type == "circle":
+            center = element.get("center", [0.0, 0.0])
+            radius = float(element.get("radius", 1.0))
+            lines.append(
+                f"{sketch_var}.addGeometry(Part.Circle("
+                f"FreeCAD.Vector({float(center[0])}, {float(center[1])}, 0), "
+                f"FreeCAD.Vector(0, 0, 1), {radius}), False)"
+            )
+        else:
+            lines.append(
+                f"# WARNING: Skipping unsupported sketch element type '{element_type}' in '{sketch_name}'"
+            )
+    return True
+
+
+def _emit_section_loft_band_reference(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    suffix: str,
+    label_stem: str,
+    sections: Any,
+) -> None:
+    """Emit a band datum plane + construction reference sketch documenting a
+    section-loft feature's measured footprint (task a's section-loft-band
+    case, and task b's doc-level fallback for bands that cannot become a
+    real Pad/Pocket): the datum sits at the band's lowest recorded Z, and
+    the reference sketch's crosshair/bbox dimensions cover the union of all
+    of the feature's sections, not just one slice -- representative even
+    for a tapering (non-constant-radius) loft. Pure documentation: the raw
+    OCCT loft/cut realised alongside this call is never touched.
+    """
+    if not isinstance(sections, list) or not sections:
+        return
+    z_values = [float(section["z"]) for section in sections if isinstance(section, dict) and "z" in section]
+    if not z_values:
+        return
+    z0 = min(z_values)
+    all_points: List[Any] = []
+    for section in sections:
+        if isinstance(section, dict):
+            all_points.extend(section.get("points") or [])
+    if len(all_points) < 3:
+        return
+    dp_var = _emit_band_datum_plane(lines, body_var, body_name, suffix, label_stem, z0)
+    _emit_band_reference_sketch(lines, body_var, body_name, suffix, label_stem, dp_var, all_points)
+
+
+def _detect_constant_radius_band(
+    sections: Any,
+) -> Optional[tuple[float, float, float, float, float]]:
+    """Return (cx, cy, radius, z0, z1) when a section-loft feature's
+    sections describe a genuine constant-radius cylindrical band (every
+    section shares the exact same point polygon, and that polygon's
+    vertices sit at a uniform radius from their centroid) -- the case
+    ring_bands / bore_bands / recess_bands loft entries always are (see
+    ``_circle_loft_points`` in the pipeline's builder_plan). Returns None
+    for anything else (tapering frustums, rotated rectangles, multi-contour
+    stacks), which must stay a raw OCCT loft.
+    """
+    if not isinstance(sections, list) or len(sections) < 2:
+        return None
+    first_points = sections[0].get("points") if isinstance(sections[0], dict) else None
+    if not isinstance(first_points, list) or len(first_points) < 8:
+        return None
+    for section in sections[1:]:
+        if not isinstance(section, dict) or section.get("points") != first_points:
+            return None
+    xs = [float(p[0]) for p in first_points]
+    ys = [float(p[1]) for p in first_points]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+    radii = [math.hypot(x - cx, y - cy) for x, y in zip(xs, ys)]
+    r_mean = sum(radii) / len(radii)
+    if r_mean <= 1e-9:
+        return None
+    if max(abs(r - r_mean) for r in radii) > max(1e-3 * r_mean, 1e-6):
+        return None
+    try:
+        z_values = [float(section["z"]) for section in sections]
+    except (KeyError, TypeError, ValueError):
+        return None
+    z0, z1 = min(z_values), max(z_values)
+    if z1 - z0 <= 1e-9:
+        return None
+    return (cx, cy, r_mean, z0, z1)
+
+
+def _channel_angle_center(segments: Any) -> Optional[float]:
+    """Return a bayonet channel's representative angular position (degrees)
+    for a reference-angle dimension: the midpoint of its first
+    circumferential segment's sweep, or the fixed angle of its first axial
+    segment, whichever is found first.
+    """
+    if not isinstance(segments, list):
+        return None
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        kind = seg.get("kind", "circumferential")
+        if kind == "circumferential":
+            a0 = seg.get("angle0")
+            a1 = seg.get("angle1")
+            if a0 is not None and a1 is not None:
+                return (float(a0) + float(a1)) / 2.0
+        elif kind == "loft":
+            bottom = seg.get("bottom") or {}
+            a0 = bottom.get("angle0")
+            a1 = bottom.get("angle1")
+            if a0 is not None and a1 is not None:
+                return (float(a0) + float(a1)) / 2.0
+        elif kind == "axial":
+            angle = seg.get("angle")
+            if angle is not None:
+                return float(angle)
+    return None
+
+
+def _channel_z_start(segments: Any) -> Optional[float]:
+    """Return a bayonet channel's starting Z (the mouth) -- the minimum z0
+    across its segments (or the bottom band's z0 for a 'loft' segment)."""
+    if not isinstance(segments, list):
+        return None
+    z_values: List[float] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        if "z0" in seg:
+            try:
+                z_values.append(float(seg["z0"]))
+            except (TypeError, ValueError):
+                pass
+    return min(z_values) if z_values else None
+
+
+def _emit_bayonet_reference_sketch(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    feat_name: str,
+    cx: float,
+    cy: float,
+    r_outer: float,
+    depth: float,
+    channel_specs: List[Any],
+    z_start: float,
+    axis_var: Optional[str],
+) -> None:
+    """Emit a per-bayonet_groove construction sketch on a datum plane at the
+    channel's z-start (task c): a baseline construction ray from the
+    channel center, one construction ray per channel at its measured
+    angular center (Reference 'Angle' dimension, non-driving) and a short
+    construction segment recording the measured relief depth (Reference
+    'DistanceX', non-driving). When the body already carries a helper axis
+    through this center (see the ``first_cylinder_center`` axis in
+    ``_gen_bodies``), the sketch imports it as external geometry and pins
+    the baseline ray's start point to it (Coincident), anchoring the
+    reference sketch to the body's main axis rather than a bare coordinate.
+    Pure documentation: the bayonet's cut geometry (``_bayonet_channel_solid``)
+    is untouched.
+    """
+    label_stem = feat_name
+    suffix = f"bayonet_{_safe_name(feat_name)}"
+    dp_var = _emit_band_datum_plane(lines, body_var, body_name, suffix, label_stem, z_start)
+
+    sketch_var = f"sketch_{body_name}_{suffix}_ref"
+    sketch_label = _safe_name(f"Sketch_{feat_name}_ref")
+    lines.append(f"{sketch_var} = {body_var}.newObject('Sketcher::SketchObject', '{sketch_label}')")
+    lines.append(f"{sketch_var}.AttachmentSupport = [({dp_var}, '')]")
+    lines.append(f"{sketch_var}.MapMode = 'FlatFace'")
+
+    if axis_var is not None:
+        lines.append(f"{sketch_var}.addExternal({axis_var}.Name, '')")
+
+    base_var = f"{sketch_var}_base"
+    lines.append(
+        f"{base_var} = {sketch_var}.addGeometry(Part.LineSegment("
+        f"FreeCAD.Vector({cx}, {cy}, 0), FreeCAD.Vector({cx + r_outer}, {cy}, 0)), True)"
+    )
+    if axis_var is not None:
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'Coincident', {base_var}, 1, -3, 1))"
+        )
+
+    depth_var = f"{sketch_var}_depth"
+    lines.append(
+        f"{depth_var} = {sketch_var}.addGeometry(Part.LineSegment("
+        f"FreeCAD.Vector({cx + r_outer - depth}, {cy}, 0), "
+        f"FreeCAD.Vector({cx + r_outer}, {cy}, 0)), True)"
+    )
+    depth_c = f"{sketch_var}_depth_c"
+    lines.append(
+        f"{depth_c} = {sketch_var}.addConstraint(Sketcher.Constraint("
+        f"'DistanceX', {depth_var}, 1, {depth_var}, 2, {depth}))"
+    )
+    lines.append(f"{sketch_var}.setDriving({depth_c}, False)")
+
+    for chan_index, segments in enumerate(channel_specs, start=1):
+        angle_center = _channel_angle_center(segments)
+        if angle_center is None:
+            continue
+        angle_rad = math.radians(angle_center)
+        chan_var = f"{sketch_var}_chan{chan_index}"
+        end_x = cx + r_outer * math.cos(angle_rad)
+        end_y = cy + r_outer * math.sin(angle_rad)
+        lines.append(
+            f"{chan_var} = {sketch_var}.addGeometry(Part.LineSegment("
+            f"FreeCAD.Vector({cx}, {cy}, 0), FreeCAD.Vector({end_x}, {end_y}, 0)), True)"
+        )
+        angle_c = f"{sketch_var}_angle_c{chan_index}"
+        lines.append(
+            f"{angle_c} = {sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'Angle', {base_var}, {chan_var}, {angle_rad}))"
+        )
+        lines.append(f"{sketch_var}.setDriving({angle_c}, False)")
+
+    lines.append(f"{sketch_var}.Visibility = False")
+
+
 def _dominant_axis(direction: Any) -> tuple[str, bool, bool]:
     """Resolve a direction vector to the closest body-origin axis."""
     if not isinstance(direction, (list, tuple)) or len(direction) != 3:
@@ -785,6 +1181,16 @@ def _gen_bodies(project: dict) -> List[str]:
     # features are emitted -- a reference for later manual work, not used by
     # any downstream geometry.
     first_cylinder_center: Dict[str, tuple[float, float]] = {}
+    # The body's helper axis Python variable, once emitted (see below), so
+    # bayonet reference sketches (task c) can anchor to it via external
+    # geometry. Populated after each body's feature loop.
+    body_axis_var: Dict[str, str] = {}
+    # True once a body has recorded ANY doc-level op (bayonet cut or section
+    # loft realised as a raw OCCT Part::Cut/Fuse) -- used to gate the
+    # constant-radius-band-to-Pad/Pocket conversion below: converting is only
+    # safe for the first such feature on a body, before any doc-level chain
+    # exists to reorder against (task b).
+    body_has_doc_level: Dict[str, bool] = {}
 
     for body in bodies:
         body_name = _safe_name(body.get("name", "Body"))
@@ -954,7 +1360,16 @@ def _gen_bodies(project: dict) -> List[str]:
                 sketch = _profile_sketch(project, feat)
                 if sketch is not None:
                     candidate_var = f"sketch_{body_name}_{feature_counter}"
-                    if _emit_profile_sketch(lines, body_var, sketch, candidate_var):
+                    band_num = None
+                    if str(sketch.get("plane", "XY")).upper() == "XY":
+                        band_num = _band_outline_index(str(sketch.get("name", "")))
+                    if band_num is not None:
+                        emitted = _emit_band_outline_sketch(
+                            lines, body_var, body_name, feature_counter, band_num, sketch, candidate_var
+                        )
+                    else:
+                        emitted = _emit_profile_sketch(lines, body_var, sketch, candidate_var)
+                    if emitted:
                         profile_var = candidate_var
                     else:
                         lines.append(
@@ -983,7 +1398,16 @@ def _gen_bodies(project: dict) -> List[str]:
                 sketch = _profile_sketch(project, feat)
                 if sketch is not None:
                     candidate_var = f"sketch_{body_name}_{feature_counter}"
-                    if _emit_profile_sketch(lines, body_var, sketch, candidate_var):
+                    band_num = None
+                    if str(sketch.get("plane", "XY")).upper() == "XY":
+                        band_num = _band_outline_index(str(sketch.get("name", "")))
+                    if band_num is not None:
+                        emitted = _emit_band_outline_sketch(
+                            lines, body_var, body_name, feature_counter, band_num, sketch, candidate_var
+                        )
+                    else:
+                        emitted = _emit_profile_sketch(lines, body_var, sketch, candidate_var)
+                    if emitted:
                         profile_var = candidate_var
                     else:
                         lines.append(
@@ -1052,28 +1476,71 @@ def _gen_bodies(project: dict) -> List[str]:
                 # body has been recomputed (raw Part shapes cannot be cut into
                 # a live PartDesign tip mid-tree).
                 bayonet_cuts.append((body_var, feat_name, feat))
+                body_has_doc_level[body_var] = True
 
-            elif feat_type == "additive_section_loft":
-                # Measured multi-section point loft. Recorded here and
-                # realised as a doc-level Part::Fuse once the body has been
-                # recomputed (raw Part.makeLoft shapes cannot be spliced into
-                # a live PartDesign tip mid-tree). after_cuts defers it to
-                # run after the normal fuse/cut phases (see collection above).
-                if feat.get("after_cuts"):
-                    deferred_ops.append(("fuse", body_var, feat_name, feat))
+            elif feat_type in ("additive_section_loft", "subtractive_section_loft"):
+                is_additive = feat_type == "additive_section_loft"
+                after_cuts = bool(feat.get("after_cuts"))
+                # Designer-tree Phase 2, task b: a constant-radius circular
+                # band (every ring_bands/bore_bands/recess_bands loft entry
+                # the pipeline emits) is geometrically just a cylinder --
+                # realise it as a real dimensioned circle sketch + Pad/Pocket
+                # on a named band datum plane (Phase 1 helper) instead of a
+                # raw OCCT loft, wherever that is provably safe: not deferred
+                # (after_cuts bands must chain onto a doc-level cut result a
+                # PartDesign feature cannot reference) and not preceded by
+                # another doc-level op on the same body (which would already
+                # have taken over the body's Tip, making a further in-tree
+                # feature build on the wrong base). Every other band --
+                # tapering frustums, multi-contour stacks, deferred islands,
+                # or a circular band chained after an earlier doc-level op --
+                # keeps its raw-loft geometry untouched and only gets the
+                # band datum-plane + reference-sketch documentation emitted
+                # alongside it below (task b's doc-level fallback / task a's
+                # section-loft-band documentation).
+                band = None if after_cuts else _detect_constant_radius_band(feat.get("sections"))
+                if band is not None and not body_has_doc_level.get(body_var, False):
+                    cx, cy, radius, z0, z1 = band
+                    height = z1 - z0
+                    sketch_var = _emit_circle_profile_sketch(
+                        lines, body_var, body_name, feature_counter, feat_name, radius, cx, cy, z0
+                    )
+                    op_class = "PartDesign::Pad" if is_additive else "PartDesign::Pocket"
+                    lines.append(f"{feat_var} = {body_var}.newObject('{op_class}', '{feat_name}')")
+                    lines.append(f"{feat_var}.Profile = {sketch_var}")
+                    lines.append(f"{sketch_var}.Visibility = False")
+                    lines.append(f"{feat_var}.Length = {height}")
+                    if not is_additive:
+                        # PartDesign::Pocket cuts opposite the sketch normal
+                        # by default; Reversed=True matches the raw loft's
+                        # z0->z1 (+Z) footprint (see the dimensioned
+                        # subtractive_cylinder path above).
+                        lines.append(f"{feat_var}.Reversed = True")
+                    previous_var = feat_var
+                elif is_additive:
+                    # Measured multi-section point loft. Recorded here and
+                    # realised as a doc-level Part::Fuse once the body has
+                    # been recomputed (raw Part.makeLoft shapes cannot be
+                    # spliced into a live PartDesign tip mid-tree). after_cuts
+                    # defers it to run after the normal fuse/cut phases (see
+                    # collection above).
+                    if after_cuts:
+                        deferred_ops.append(("fuse", body_var, feat_name, feat))
+                    else:
+                        section_lofts.append((body_var, feat_name, feat))
+                    body_has_doc_level[body_var] = True
                 else:
-                    section_lofts.append((body_var, feat_name, feat))
-
-            elif feat_type == "subtractive_section_loft":
-                # Subtractive twin of additive_section_loft: the same measured
-                # polygon-stack loft, but recorded here and realised as a
-                # doc-level Part::Cut (removing material) once the body has
-                # been recomputed, chained after any additive fusion on the
-                # same body (see the emission loop below).
-                if feat.get("after_cuts"):
-                    deferred_ops.append(("cut", body_var, feat_name, feat))
-                else:
-                    subtractive_section_lofts.append((body_var, feat_name, feat))
+                    # Subtractive twin of additive_section_loft: the same
+                    # measured polygon-stack loft, but recorded here and
+                    # realised as a doc-level Part::Cut (removing material)
+                    # once the body has been recomputed, chained after any
+                    # additive fusion on the same body (see the emission
+                    # loop below).
+                    if after_cuts:
+                        deferred_ops.append(("cut", body_var, feat_name, feat))
+                    else:
+                        subtractive_section_lofts.append((body_var, feat_name, feat))
+                    body_has_doc_level[body_var] = True
 
             else:
                 lines.append(
@@ -1096,6 +1563,7 @@ def _gen_bodies(project: dict) -> List[str]:
                 f"FreeCAD.Vector({cx}, {cy}, 0), FreeCAD.Rotation())"
             )
             lines.append("")
+            body_axis_var[body_var] = axis_var
 
     if (
         bayonet_cuts
@@ -1121,6 +1589,7 @@ def _gen_bodies(project: dict) -> List[str]:
         return body_current.get(body_var, body_var)
 
     for loft_index, (body_var, feat_name, feat) in enumerate(section_lofts, start=1):
+        body_name = body_var[len("body_"):]
         sections = feat.get("sections", [])
         ruled = bool(feat.get("ruled", True))
         redrill_holes = feat.get("redrill_holes") or []
@@ -1184,7 +1653,13 @@ def _gen_bodies(project: dict) -> List[str]:
             lines.append("")
             body_current[body_var] = recut_var
 
+        _emit_section_loft_band_reference(
+            lines, body_var, body_name, f"loft{loft_index}", f"{safe_feat_name}_band{loft_index}", sections
+        )
+        lines.append("")
+
     for cut_index, (body_var, feat_name, feat) in enumerate(bayonet_cuts, start=1):
+        body_name = body_var[len("body_"):]
         props = feat.get("properties", {})
 
         def _p(key, default):
@@ -1247,7 +1722,24 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append("")
         body_current[body_var] = cut_var
 
+        z_starts = [z for z in (_channel_z_start(segments) for segments in channel_specs) if z is not None]
+        _emit_bayonet_reference_sketch(
+            lines,
+            body_var,
+            body_name,
+            feat_name,
+            cx,
+            cy,
+            r_outer,
+            depth,
+            channel_specs,
+            min(z_starts) if z_starts else 0.0,
+            body_axis_var.get(body_var),
+        )
+        lines.append("")
+
     for loft_index, (body_var, feat_name, feat) in enumerate(subtractive_section_lofts, start=1):
+        body_name = body_var[len("body_"):]
         sections = feat.get("sections", [])
         ruled = bool(feat.get("ruled", True))
         safe_feat_name = _safe_name(feat_name)
@@ -1266,6 +1758,11 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append("")
         body_current[body_var] = cut_var
 
+        _emit_section_loft_band_reference(
+            lines, body_var, body_name, f"subloft{loft_index}", f"{safe_feat_name}_band{loft_index}", sections
+        )
+        lines.append("")
+
     # after_cuts phase: islands that must be added back (and, for a bore,
     # re-drilled) AFTER the cavity cuts above have already run -- e.g. a
     # socket tube rebuilt inside a chamber that is itself cut doc-level now,
@@ -1278,7 +1775,8 @@ def _gen_bodies(project: dict) -> List[str]:
     # footprint (volume campaign iteration 5: the socket core pin).
     fuse_count = 0
     cut_count = 0
-    for kind, body_var, feat_name, feat in deferred_ops:
+    for op_index, (kind, body_var, feat_name, feat) in enumerate(deferred_ops, start=1):
+        body_name = body_var[len("body_"):]
         sections = feat.get("sections", [])
         ruled = bool(feat.get("ruled", True))
         safe_feat_name = _safe_name(feat_name)
@@ -1305,6 +1803,11 @@ def _gen_bodies(project: dict) -> List[str]:
         lines.append(f"{op_var}.Tool = {loft_var}")
         lines.append("")
         body_current[body_var] = op_var
+
+        _emit_section_loft_band_reference(
+            lines, body_var, body_name, f"deferred{op_index}", f"{safe_feat_name}_band{op_index}", sections
+        )
+        lines.append("")
 
     return lines
 
@@ -1414,9 +1917,15 @@ def _gen_export(
     lines.append("# features inside a PartDesign body, a hidden groove tool solid) must")
     lines.append("# NOT be exported alongside their result: meshing them too overlays")
     lines.append("# the unmodified input over the result and e.g. fills a subtractive")
-    lines.append("# groove straight back in.")
+    lines.append("# groove straight back in. Sketches (including the Designer-tree Phase")
+    lines.append("# 2 construction-only band/bayonet reference sketches, which carry no")
+    lines.append("# non-construction geometry and so have a null/invalid Shape) must never")
+    lines.append("# be considered here regardless of InList -- evaluating .Shape.isValid()")
+    lines.append("# on one raises an OCC exception rather than returning False.")
     lines.append("export_objects = []")
     lines.append("for obj in doc.Objects:")
+    lines.append("    if obj.TypeId == 'Sketcher::SketchObject':")
+    lines.append("        continue")
     lines.append("    if hasattr(obj, 'Shape') and obj.Shape.isValid() and not obj.InList:")
     lines.append("        export_objects.append(obj)")
     lines.append("")

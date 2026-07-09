@@ -1306,11 +1306,20 @@ class TestBody:
         macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
 
         assert "newObject('Sketcher::SketchObject', 'BaseOutline')" in macro
-        assert macro.count("Part.LineSegment(") == 4
+        # Designer-tree Phase 2 (task a): a sketch named "BaseOutline" is a
+        # padded_outline_stack band, so it now attaches to a named band datum
+        # plane (instead of a raw Placement offset) and gains a
+        # construction-only reference sketch (crosshair through the band's
+        # centroid) alongside its own 4-edge outline -- 6 LineSegments total,
+        # not 4.
+        assert macro.count("Part.LineSegment(") == 6
         assert "FreeCAD.Vector(30.0, 10.0, 0)" in macro
         assert ".Profile = sketch_MainBody_1" in macro
         assert ".Length = 16.0" in macro
         assert "sketch_MainBody_1.Visibility = False" in macro
+        assert "newObject('PartDesign::Plane', 'DP_BaseOutlineStack_band1_z" in macro
+        assert "sketch_MainBody_1.AttachmentSupport = [(dp_MainBody_1_band1, '')]" in macro
+        assert "sketch_MainBody_1.MapMode = 'FlatFace'" in macro
 
     def test_macro_pad_without_resolvable_sketch_keeps_previous_behavior(self):
         from cli_anything.freecad.utils.freecad_macro_gen import generate_macro

@@ -1258,6 +1258,392 @@ print("RESULT_JSON:" + json.dumps(result))
             f"without={volumes['without_after_cuts']:.2f}, with={volumes['with_after_cuts']:.2f}"
         )
 
+    def test_stack_band_outline_pads_attach_to_named_datum_planes(self, tmp_path):
+        """Designer-tree Phase 2, task a: a padded_outline_stack (one Pad per
+        measured z-band, sketch named "BaseOutline" / "BaseOutlineBandN")
+        must attach each band's real outline sketch to a named
+        DP_BaseOutlineStack_band<N>_z<...> datum plane instead of a raw
+        Placement offset, and carry a construction-only reference sketch
+        recording the band's measured bbox -- with the padded solid's volume
+        unchanged from the raw-offset path (same two 10x10 squares stacked
+        2mm then 3mm tall used here summing to a simple two-block volume).
+        """
+        from cli_anything.freecad.utils.freecad_backend import run_macro_content
+
+        proj = create_document(name="StackBands")
+        create_body(proj, name="MainBody")
+
+        create_sketch(proj, name="BaseOutline", plane="XY", offset=0.0)
+        pts = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+        for i in range(4):
+            add_line(proj, 0, start=pts[i], end=pts[(i + 1) % 4])
+        close_sketch(proj, 0)
+        pad(proj, 0, 0, length=2.0)
+
+        create_sketch(proj, name="BaseOutlineBand2", plane="XY", offset=2.0)
+        for i in range(4):
+            add_line(proj, 1, start=pts[i], end=pts[(i + 1) % 4])
+        close_sketch(proj, 1)
+        pad(proj, 0, 1, length=3.0)
+
+        output_stl = str(tmp_path / "stack_bands.stl")
+        export_project(proj, output_stl, preset="stl")
+        volume = _stl_mesh_volume(output_stl)
+        expected_volume = 10.0 * 10.0 * (2.0 + 3.0)
+        assert abs(volume - expected_volume) < 0.001 * expected_volume, (
+            f"expected ~{expected_volume:.3f} mm^3, got {volume:.3f} mm^3"
+        )
+
+        output_fcstd = str(tmp_path / "stack_bands.FCStd")
+        export_project(proj, output_fcstd, preset="fcstd")
+
+        inspect_script = f"""
+import FreeCAD
+import json
+
+doc = FreeCAD.openDocument({output_fcstd!r})
+planes = [o for o in doc.Objects if o.TypeId == 'PartDesign::Plane']
+sketches = [o for o in doc.Objects if o.TypeId == 'Sketcher::SketchObject']
+pads = [o for o in doc.Objects if o.TypeId == 'PartDesign::Pad']
+
+result = {{
+    "plane_labels": sorted(o.Label for o in planes),
+    "ref_sketch_constraints": sorted(
+        o.ConstraintCount for o in sketches if o.Label.endswith('_ref')
+    ),
+    "pad_profiles_attached_to_plane": [
+        p.Profile[0].AttachmentSupport[0][0].TypeId == 'PartDesign::Plane'
+        for p in pads
+        if p.Profile
+    ],
+}}
+print("RESULT_JSON:" + json.dumps(result))
+"""
+        run_result = run_macro_content(inspect_script, timeout=60)
+        assert run_result["returncode"] == 0, run_result["stderr"]
+        json_line = next(
+            line for line in run_result["stdout"].splitlines() if line.startswith("RESULT_JSON:")
+        )
+        result = json.loads(json_line[len("RESULT_JSON:"):])
+
+        assert len(result["plane_labels"]) == 2
+        assert all(label.startswith("DP_BaseOutlineStack_band") for label in result["plane_labels"])
+        assert result["plane_labels"][0].startswith("DP_BaseOutlineStack_band1_z")
+        assert result["plane_labels"][1].startswith("DP_BaseOutlineStack_band2_z")
+        assert len(result["ref_sketch_constraints"]) == 2
+        assert all(count >= 2 for count in result["ref_sketch_constraints"])
+        assert result["pad_profiles_attached_to_plane"] == [True, True]
+
+        print(f"\n  stack band structure: planes={result['plane_labels']}, "
+              f"ref constraints={result['ref_sketch_constraints']}, "
+              f"volume={volume:.2f} mm^3 (expected {expected_volume:.2f})")
+
+    def test_section_loft_band_gets_reference_documentation_without_changing_geometry(self, tmp_path):
+        """Designer-tree Phase 2, task a (section-loft-band case): an
+        additive_section_loft must gain a band datum plane + construction
+        reference sketch documenting its footprint, while the loft's own
+        geometry (a raw OCCT Part.makeLoft) stays byte-for-byte the frustum
+        volume the pre-Phase-2 regression test already proves.
+        """
+        from cli_anything.freecad.utils.freecad_backend import run_macro_content
+
+        cx, cy = 7.0, 5.0
+        proj = create_document(name="LoftBandDocs")
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10.0, width=10.0, height=2.0,
+                     position=[cx - 5.0, cy - 5.0, 0.0])
+        sections = [
+            {"z": 2.0, "points": self._square_loft_points(cx, cy, 5.0)},
+            {"z": 4.0, "points": self._square_loft_points(cx, cy, 4.0)},
+            {"z": 6.0, "points": self._square_loft_points(cx, cy, 5.0)},
+        ]
+        additive_section_loft(proj, body_index=0, sections=sections, ruled=True)
+
+        output_stl = str(tmp_path / "loft_band_docs.stl")
+        export_project(proj, output_stl, preset="stl")
+        volume = _stl_mesh_volume(output_stl)
+
+        box_volume = 10.0 * 10.0 * 2.0
+        seg1 = 2.0 * (10.0 ** 2 + 10.0 * 8.0 + 8.0 ** 2) / 3.0
+        seg2 = 2.0 * (8.0 ** 2 + 8.0 * 10.0 + 10.0 ** 2) / 3.0
+        expected_total = box_volume + seg1 + seg2
+        assert abs(volume - expected_total) < 0.05 * expected_total, (
+            f"expected ~{expected_total:.1f} mm^3, got {volume:.1f} mm^3 -- the "
+            f"reference documentation must not perturb the loft's own geometry"
+        )
+
+        output_fcstd = str(tmp_path / "loft_band_docs.FCStd")
+        export_project(proj, output_fcstd, preset="fcstd")
+        inspect_script = f"""
+import FreeCAD
+import json
+
+doc = FreeCAD.openDocument({output_fcstd!r})
+planes = [o.Label for o in doc.Objects if o.TypeId == 'PartDesign::Plane']
+ref_sketches = [o for o in doc.Objects if o.TypeId == 'Sketcher::SketchObject' and o.Label.endswith('_ref')]
+print("RESULT_JSON:" + json.dumps({{
+    "plane_labels": planes,
+    "ref_constraint_counts": [o.ConstraintCount for o in ref_sketches],
+    "ref_non_driving": [
+        not o.Constraints[i].Driving
+        for o in ref_sketches
+        for i in range(o.ConstraintCount)
+    ],
+}}))
+"""
+        run_result = run_macro_content(inspect_script, timeout=60)
+        assert run_result["returncode"] == 0, run_result["stderr"]
+        json_line = next(
+            line for line in run_result["stdout"].splitlines() if line.startswith("RESULT_JSON:")
+        )
+        result = json.loads(json_line[len("RESULT_JSON:"):])
+        # two datum planes exist -- one from the base box (Phase 1's
+        # dimensioned-primitive path) and one for this section-loft band;
+        # only the loft's carries a "_ref" reference sketch.
+        assert len(result["plane_labels"]) == 2
+        assert all(label.startswith("DP_") for label in result["plane_labels"])
+        assert any("section_loft" in label for label in result["plane_labels"])
+        assert len(result["ref_constraint_counts"]) == 1
+        assert result["ref_constraint_counts"][0] == 2
+        assert all(result["ref_non_driving"]), "band reference dimensions must be non-driving"
+
+        print(f"\n  loft band docs: plane={result['plane_labels']}, "
+              f"volume={volume:.2f} mm^3 (expected {expected_total:.2f})")
+
+    def test_constant_radius_band_converts_to_dimensioned_circle_pad(self, tmp_path):
+        """Designer-tree Phase 2, task b: a standalone constant-radius
+        section-loft band (the ring_bands/bore_bands/recess_bands shape,
+        not deferred and not preceded by any other doc-level op on its
+        body) must be realised as a real dimensioned circle sketch + Pad on
+        a named band datum plane (Phase 1 helper) instead of a raw N-gon
+        OCCT loft -- trading the polygon approximation's area deficit for
+        an exact analytic cylinder volume.
+        """
+        from cli_anything.freecad.utils.freecad_backend import run_macro_content
+
+        def ring_points(radius, cx=4.0, cy=3.0, segments=24):
+            return [
+                [cx + radius * math.cos(2.0 * math.pi * i / segments),
+                 cy + radius * math.sin(2.0 * math.pi * i / segments)]
+                for i in range(segments)
+            ]
+
+        cx, cy, radius = 4.0, 3.0, 3.0
+        points = ring_points(radius)
+        proj = create_document(name="ConstantRadiusBand")
+        create_body(proj, name="MainBody")
+        # A small, far-away base feature: additive_section_loft requires an
+        # existing body feature to attach to, and this one (a plain
+        # dimensioned box, Phase 1's path) does not set body_has_doc_level,
+        # so the circular band below is still the body's first doc-level op
+        # and remains eligible for conversion.
+        additive_box(proj, body_index=0, length=1.0, width=1.0, height=1.0,
+                     position=[-10.0, -10.0, 0.0])
+        additive_section_loft(
+            proj, body_index=0,
+            sections=[
+                {"z": 0.0, "points": points},
+                {"z": 3.0, "points": points},
+                {"z": 6.0, "points": points},
+            ],
+            ruled=True,
+        )
+
+        output_stl = str(tmp_path / "constant_radius.stl")
+        export_project(proj, output_stl, preset="stl")
+        volume = _stl_mesh_volume(output_stl)
+
+        base_box_volume = 1.0 * 1.0 * 1.0
+        exact_cylinder_volume = math.pi * radius ** 2 * 6.0
+        ngon_area = 0.5 * 24 * radius ** 2 * math.sin(2.0 * math.pi / 24)
+        ngon_volume = ngon_area * 6.0
+        expected_total = base_box_volume + exact_cylinder_volume
+        ngon_total = base_box_volume + ngon_volume
+        assert abs(volume - expected_total) < 0.01 * expected_total, (
+            f"expected the true-circle Pad volume ~{expected_total:.2f} mm^3, "
+            f"got {volume:.2f} mm^3 (24-gon loft would have given ~{ngon_total:.2f})"
+        )
+        assert abs(volume - ngon_total) > 0.005 * exact_cylinder_volume, (
+            "volume should differ measurably from the old 24-gon loft approximation, "
+            "confirming a real conversion happened rather than a no-op"
+        )
+
+        output_fcstd = str(tmp_path / "constant_radius.FCStd")
+        export_project(proj, output_fcstd, preset="fcstd")
+        inspect_script = f"""
+import FreeCAD
+import json
+
+doc = FreeCAD.openDocument({output_fcstd!r})
+pads = [o for o in doc.Objects if o.TypeId == 'PartDesign::Pad']
+planes = [o.Label for o in doc.Objects if o.TypeId == 'PartDesign::Plane']
+sketches = [o for o in doc.Objects if o.TypeId == 'Sketcher::SketchObject']
+radius_constraints = []
+for s in sketches:
+    for c in s.Constraints:
+        if c.Type == 'Radius':
+            radius_constraints.append(c.Value)
+print("RESULT_JSON:" + json.dumps({{
+    "pad_count": len(pads),
+    "plane_labels": planes,
+    "radius_constraints": radius_constraints,
+}}))
+"""
+        run_result = run_macro_content(inspect_script, timeout=60)
+        assert run_result["returncode"] == 0, run_result["stderr"]
+        json_line = next(
+            line for line in run_result["stdout"].splitlines() if line.startswith("RESULT_JSON:")
+        )
+        result = json.loads(json_line[len("RESULT_JSON:"):])
+        # one Pad for the base box (Phase 1 dimensioned-box path) plus one
+        # for the converted constant-radius band.
+        assert result["pad_count"] == 2, "the constant-radius band must become a real PartDesign::Pad"
+        assert len(result["plane_labels"]) == 2
+        assert any(abs(value - radius) < 1e-3 for value in result["radius_constraints"]), (
+            f"expected a Radius constraint ~{radius}, got {result['radius_constraints']}"
+        )
+
+        print(f"\n  constant-radius band: volume={volume:.2f} mm^3 "
+              f"(exact total {expected_total:.2f}, old-24gon total {ngon_total:.2f}), "
+              f"pads={result['pad_count']}")
+
+    def test_after_cuts_band_stays_doc_level_with_reference_documentation(self, tmp_path):
+        """Designer-tree Phase 2, task b's doc-level fallback: an after_cuts
+        constant-radius band (ring_bands/bore_bands' real shape) must NOT
+        be converted to a Pad -- it still needs the doc-level chain onto the
+        cavity cut's result -- but must still gain the band datum plane +
+        reference sketch documentation, and its preserved-island volume
+        behaviour (the whole point of after_cuts) must be unaffected.
+        """
+        from cli_anything.freecad.utils.freecad_backend import run_macro_content
+
+        def ring_points(radius, cx=5.0, cy=5.0, segments=32):
+            return [
+                [cx + radius * math.cos(2.0 * math.pi * i / segments),
+                 cy + radius * math.sin(2.0 * math.pi * i / segments)]
+                for i in range(segments)
+            ]
+
+        proj = create_document(name="AfterCutsBandDocs")
+        create_body(proj)
+        additive_box(proj, body_index=0, length=10.0, width=10.0, height=10.0)
+        square = self._square_loft_points(5.0, 5.0, 2.5)
+        subtractive_section_loft(
+            proj, body_index=0,
+            sections=[
+                {"z": 2.0, "points": square},
+                {"z": 5.0, "points": square},
+                {"z": 8.0, "points": square},
+            ],
+            ruled=True,
+        )
+        additive_section_loft(
+            proj, body_index=0,
+            sections=[
+                {"z": 3.0, "points": ring_points(2.0)},
+                {"z": 4.0, "points": ring_points(2.0)},
+                {"z": 5.0, "points": ring_points(2.0)},
+            ],
+            ruled=True,
+            after_cuts=True,
+        )
+
+        output_fcstd = str(tmp_path / "after_cuts_band_docs.FCStd")
+        export_project(proj, output_fcstd, preset="fcstd")
+        inspect_script = f"""
+import FreeCAD
+import json
+
+doc = FreeCAD.openDocument({output_fcstd!r})
+pads = [o for o in doc.Objects if o.TypeId == 'PartDesign::Pad']
+planes = [o.Label for o in doc.Objects if o.TypeId == 'PartDesign::Plane']
+fuses = [o for o in doc.Objects if o.TypeId == 'Part::Fuse']
+print("RESULT_JSON:" + json.dumps({{
+    "pad_count": len(pads),
+    "plane_labels": planes,
+    "fuse_count": len(fuses),
+}}))
+"""
+        run_result = run_macro_content(inspect_script, timeout=60)
+        assert run_result["returncode"] == 0, run_result["stderr"]
+        json_line = next(
+            line for line in run_result["stdout"].splitlines() if line.startswith("RESULT_JSON:")
+        )
+        result = json.loads(json_line[len("RESULT_JSON:"):])
+        # exactly one Pad exists -- the base box (Phase 1's dimensioned-primitive
+        # path, unrelated to this feature); the after_cuts ring must NOT add a
+        # second Pad of its own, i.e. it must stay a doc-level Part::Fuse.
+        assert result["pad_count"] == 1, (
+            "an after_cuts band must stay a doc-level Part::Fuse, not become its own Pad"
+        )
+        assert result["fuse_count"] >= 1
+        # three datum planes: the base box (Phase 1), the main-cavity
+        # subtractive band, and the after_cuts ring -- all doc-level except
+        # the box's Pad.
+        assert len(result["plane_labels"]) == 3
+        assert all(label.startswith("DP_") for label in result["plane_labels"])
+
+        print(f"\n  after_cuts band structure: pads={result['pad_count']}, "
+              f"fuses={result['fuse_count']}, plane={result['plane_labels']}")
+
+    def test_bayonet_groove_gets_reference_sketch_anchored_to_body_axis(self, tmp_path):
+        """Designer-tree Phase 2, task c: a bayonet_groove must gain a
+        construction reference sketch on a datum plane at the channel's
+        z-start, carrying non-driving Angle/Distance reference dimensions
+        and an ExternalGeometry import of the body's helper axis -- while
+        the cut's own geometry (and its volume) stays exactly what the
+        pre-existing off-origin regression test already proves.
+        """
+        from cli_anything.freecad.utils.freecad_backend import run_macro_content
+
+        proj = create_document(name="BayonetRefSketch")
+        create_body(proj, name="MainBody")
+        additive_cylinder(proj, body_index=0, radius=6.236, height=7.87,
+                           position=[7.2, 7.15, 8.17])
+        segments = [
+            {"kind": "circumferential", "angle0": 69.0, "angle1": 157.0,
+             "z0": 8.9, "z1": 10.4, "wall_radius": 6.23, "depth": 0.95},
+        ]
+        bayonet_groove(proj, body_index=0, segments=segments,
+                       wall_radius=6.256, depth=0.9,
+                       center_x=7.2, center_y=7.15, symmetry=1)
+
+        output_fcstd = str(tmp_path / "bayonet_ref.FCStd")
+        export_project(proj, output_fcstd, preset="fcstd")
+        inspect_script = f"""
+import FreeCAD
+import json
+
+doc = FreeCAD.openDocument({output_fcstd!r})
+planes = [o.Label for o in doc.Objects if o.TypeId == 'PartDesign::Plane']
+ref_sketches = [o for o in doc.Objects if o.TypeId == 'Sketcher::SketchObject' and o.Label.endswith('_ref')]
+info = []
+for s in ref_sketches:
+    info.append({{
+        "external_geometry_count": len(s.ExternalGeometry),
+        "constraint_types": sorted(set(c.Type for c in s.Constraints)),
+        "non_driving_count": sum(1 for c in s.Constraints if not c.Driving),
+    }})
+print("RESULT_JSON:" + json.dumps({{"plane_labels": planes, "ref_sketches": info}}))
+"""
+        run_result = run_macro_content(inspect_script, timeout=60)
+        assert run_result["returncode"] == 0, run_result["stderr"]
+        json_line = next(
+            line for line in run_result["stdout"].splitlines() if line.startswith("RESULT_JSON:")
+        )
+        result = json.loads(json_line[len("RESULT_JSON:"):])
+        assert len(result["plane_labels"]) == 2  # cylinder's own + the bayonet's
+        assert any("bayonet" in label.lower() for label in result["plane_labels"])
+        assert len(result["ref_sketches"]) == 1
+        ref = result["ref_sketches"][0]
+        assert ref["external_geometry_count"] >= 1, "must import the body axis as external geometry"
+        assert "Angle" in ref["constraint_types"]
+        assert ref["non_driving_count"] >= 2  # depth reference + angle reference
+
+        print(f"\n  bayonet reference sketch: planes={result['plane_labels']}, "
+              f"external_geo={ref['external_geometry_count']}, "
+              f"constraints={ref['constraint_types']}")
+
     @pytest.mark.skipif(not _has_freecad_preview(), reason="GUI-capable FreeCAD not installed")
     def test_preview_capture_bundle(self, tmp_path):
         proj = create_document(name="PreviewPart")
