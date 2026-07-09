@@ -60,6 +60,7 @@ from cli_anything.freecad.core.body import (
     additive_cylinder,
     additive_section_loft,
     subtractive_section_loft,
+    subtractive_cylinder,
     bayonet_groove,
     create_body,
     pad,
@@ -365,11 +366,57 @@ class TestIntermediateFiles:
         macro = generate_macro(proj, str(tmp_path / "tower.step"))
         ast.parse(macro)
 
-        assert "PartDesign::AdditiveBox" in macro
+        # unrotated additive_box now lowers to a dimensioned sketch on a
+        # named datum plane + PartDesign::Pad (see freecad_macro_gen.py),
+        # not a raw PartDesign::AdditiveBox primitive -- assert the new
+        # construct plus its driving dimensions instead of the old class.
+        assert "PartDesign::Plane" in macro
+        assert "PartDesign::Pad" in macro
+        assert "Sketcher.Constraint('DistanceX'" in macro
+        assert "Sketcher.Constraint('DistanceY'" in macro
         assert "PartDesign::PolarPattern" in macro
         assert "PartDesign::LinearPattern" in macro
         assert "Placement = FreeCAD.Placement" in macro
         assert "_body_origin_ref" in macro
+
+    def test_dimensioned_sketch_pad_pocket_constraints_in_macro(self, tmp_path):
+        """additive_cylinder / subtractive_cylinder / additive_box (unrotated)
+        must lower to a named datum plane + dimensioned Sketcher profile +
+        Pad/Pocket -- not a bare PartDesign primitive -- with the driving
+        constraints (Radius, DistanceX/DistanceY, Coincident-to-origin) a
+        human would expect to find and edit later.
+        """
+        proj = create_document(name="DimensionedFeatures")
+        create_body(proj, name="MainBody")
+        # centered box: corner pinned to the sketch origin (Coincident), not
+        # DistanceX/DistanceY, since it sits at (0, 0)
+        additive_box(proj, 0, length=20.0, width=15.0, height=6.0)
+        # off-origin cylinder boss: center pinned via DistanceX/DistanceY
+        additive_cylinder(proj, 0, radius=4.0, height=9.0, position=[10.0, 8.0, 6.0])
+        # off-origin subtractive bore through the boss
+        subtractive_cylinder(proj, 0, radius=1.5, height=20.0, position=[10.0, 8.0, -2.0])
+
+        macro = generate_macro(proj, str(tmp_path / "dimensioned.step"))
+        ast.parse(macro)
+
+        # named datum planes, offset from the body's XY plane
+        assert "PartDesign::Plane" in macro
+        assert "DP_Feature_additive_box_z_0" in macro
+        assert "DP_Feature_additive_cylinder_z_6" in macro
+        # driving dimensions
+        assert "Sketcher.Constraint('Radius'" in macro
+        assert macro.count("Sketcher.Constraint('Radius'") == 2  # additive + subtractive cylinder
+        assert "Sketcher.Constraint('DistanceX'" in macro
+        assert "Sketcher.Constraint('DistanceY'" in macro
+        assert "Sketcher.Constraint('Coincident'" in macro
+        # Pad/Pocket reference the sketch as Profile, not a raw primitive
+        assert "PartDesign::Pad" in macro
+        assert "PartDesign::Pocket" in macro
+        assert ".Profile = sketch_" in macro
+        # helper axis on the body's main axis, through the first cylinder's center
+        assert "PartDesign::Line" in macro
+        assert "DA_MainBody_axis" in macro
+        assert "FreeCAD.Vector(10.0, 8.0, 0)" in macro
 
     def test_macro_generation_mirror_part_rendering(self, tmp_path):
         """Generate a macro that reconstructs mirrored primitive parts for preview/export."""
@@ -582,6 +629,35 @@ def _stl_mesh_volume(path: str) -> float:
     return abs(volume)
 
 
+def _stl_mesh_bbox(path: str) -> tuple:
+    """Axis-aligned bounding box (xmin, xmax, ymin, ymax, zmin, zmax) of an
+    STL mesh, parsed the same way as :func:`_stl_mesh_volume`."""
+    with open(path, "rb") as f:
+        head = f.read(80)
+    verts: List[tuple] = []
+    if head.decode("ascii", errors="ignore").strip().lower().startswith("solid"):
+        with open(path, "r", encoding="ascii", errors="ignore") as f:
+            for line in f:
+                parts = line.split()
+                if parts[:1] == ["vertex"]:
+                    verts.append(tuple(float(p) for p in parts[1:4]))
+    else:
+        record = struct.Struct("<12fH")
+        with open(path, "rb") as f:
+            f.seek(80)
+            (count,) = struct.unpack("<I", f.read(4))
+            data = f.read(count * record.size)
+        for i in range(count):
+            vals = record.unpack_from(data, i * record.size)
+            verts.append(vals[3:6])
+            verts.append(vals[6:9])
+            verts.append(vals[9:12])
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+    return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+
 @pytest.mark.skipif(not _has_freecad(), reason="FreeCAD not installed")
 class TestFreeCADBackend:
     """Tests that require the real FreeCAD headless backend."""
@@ -678,6 +754,110 @@ class TestFreeCADBackend:
         assert size > 0, "FCStd file is empty"
 
         print(f"\n  FCStd: {output} ({size:,} bytes)")
+
+    def test_dimensioned_primitives_volume_and_bbox_regression(self, tmp_path):
+        """Geometry regression for the sketch+pad/pocket rewrite of
+        additive_cylinder / subtractive_cylinder / additive_box: an
+        off-origin box with a boss cylinder on top and a through-bore must
+        still export the exact analytic volume and bounding box (within
+        +-0.1%) that the old bare PartDesign primitives produced -- the
+        dimensioned-sketch path must be geometrically transparent, not just
+        "close enough".
+        """
+        proj = create_document(name="DimensionedRegression")
+        create_body(proj)
+        # off-origin box: corner at (3, 2, 0), spans to (23, 17, 6)
+        additive_box(proj, 0, length=20.0, width=15.0, height=6.0, position=[3.0, 2.0, 0.0])
+        # boss cylinder centered inside the box footprint, sitting on top
+        additive_cylinder(proj, 0, radius=4.0, height=9.0, position=[10.0, 8.0, 6.0])
+        # through-bore, same axis, taller than the stack so it pierces cleanly
+        subtractive_cylinder(proj, 0, radius=1.5, height=20.0, position=[10.0, 8.0, -2.0])
+
+        output = str(tmp_path / "dimensioned.stl")
+        export_project(proj, output, preset="stl")
+
+        box_volume = 20.0 * 15.0 * 6.0
+        boss_volume = math.pi * 4.0 ** 2 * 9.0
+        # the bore only removes material where it overlaps the solid stack
+        # (box bottom z=0 to boss top z=15), not its full nominal length
+        bore_volume = math.pi * 1.5 ** 2 * 15.0
+        expected_volume = box_volume + boss_volume - bore_volume
+
+        volume = _stl_mesh_volume(output)
+        assert abs(volume - expected_volume) < 0.001 * expected_volume, (
+            f"expected ~{expected_volume:.3f} mm^3, got {volume:.3f} mm^3"
+        )
+
+        xmin, xmax, ymin, ymax, zmin, zmax = _stl_mesh_bbox(output)
+        expected_bbox = (3.0, 23.0, 2.0, 17.0, 0.0, 15.0)
+        got_bbox = (xmin, xmax, ymin, ymax, zmin, zmax)
+        for got, expected in zip(got_bbox, expected_bbox):
+            tol = max(0.001 * abs(expected), 1e-6)
+            assert abs(got - expected) < tol, (
+                f"bbox mismatch: expected {expected_bbox}, got {got_bbox}"
+            )
+
+        print(f"\n  dimensioned regression volume: {volume:.3f} mm^3 "
+              f"(expected {expected_volume:.3f}), bbox: {got_bbox}")
+
+    def test_fcstd_datum_plane_sketch_pad_structure(self, tmp_path):
+        """Open the exported FCStd of a small dimensioned-feature project and
+        assert, at the real FreeCAD-object level (not just macro text), that
+        the datum plane exists, its sketch carries constraints, and the Pad
+        references that sketch as its Profile.
+        """
+        from cli_anything.freecad.utils.freecad_backend import run_macro_content
+
+        proj = create_document(name="DimensionedStructure")
+        create_body(proj, name="MainBody")
+        additive_cylinder(proj, 0, radius=6.2, height=7.5, position=[7.2, 7.2, 0.0])
+
+        output = str(tmp_path / "structure.FCStd")
+        export_project(proj, output, preset="fcstd")
+
+        inspect_script = f"""
+import FreeCAD
+import json
+
+doc = FreeCAD.openDocument({output!r})
+body = doc.getObject('MainBody')
+planes = [o for o in doc.Objects if o.TypeId == 'PartDesign::Plane']
+sketches = [o for o in doc.Objects if o.TypeId == 'Sketcher::SketchObject']
+pads = [o for o in doc.Objects if o.TypeId == 'PartDesign::Pad']
+axes = [o for o in doc.Objects if o.TypeId == 'PartDesign::Line']
+
+result = {{
+    "plane_labels": [o.Label for o in planes],
+    "sketch_constraint_counts": [o.ConstraintCount for o in sketches],
+    "pad_profile_is_sketch": [
+        p.Profile[0].TypeId == 'Sketcher::SketchObject'
+        if p.Profile and isinstance(p.Profile, tuple) else False
+        for p in pads
+    ],
+    "axis_labels": [o.Label for o in axes],
+}}
+print("RESULT_JSON:" + json.dumps(result))
+"""
+        run_result = run_macro_content(inspect_script, timeout=60)
+        assert run_result["returncode"] == 0, run_result["stderr"]
+
+        json_line = next(
+            line for line in run_result["stdout"].splitlines() if line.startswith("RESULT_JSON:")
+        )
+        result = json.loads(json_line[len("RESULT_JSON:"):])
+
+        assert len(result["plane_labels"]) == 1
+        assert result["plane_labels"][0].startswith("DP_")
+        assert len(result["sketch_constraint_counts"]) == 1
+        assert result["sketch_constraint_counts"][0] > 0
+        assert len(result["pad_profile_is_sketch"]) == 1
+        assert result["pad_profile_is_sketch"][0] is True
+        assert len(result["axis_labels"]) == 1
+        assert result["axis_labels"][0] == "DA_MainBody_axis"
+
+        print(f"\n  FCStd structure: plane={result['plane_labels']}, "
+              f"sketch constraints={result['sketch_constraint_counts']}, "
+              f"axis={result['axis_labels']}")
 
     def test_bayonet_cut_bites_narrowed_neck_via_segment_wall_radius(self, tmp_path):
         """Regression for the FreeCAD-STL-Importer s15-full case: on a tapered

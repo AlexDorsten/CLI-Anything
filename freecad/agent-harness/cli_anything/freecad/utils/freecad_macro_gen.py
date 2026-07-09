@@ -321,6 +321,207 @@ def _emit_profile_sketch(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Dimensioned sketch+pad/pocket generation for primitive PartDesign features.
+#
+# additive_cylinder / subtractive_cylinder / additive_box used to lower
+# straight to a PartDesign primitive feature (AdditiveCylinder, Pocket-less
+# SubtractiveCylinder, AdditiveBox) with a raw Placement -- geometrically
+# correct, but leaving no sketch, no datum plane and no driving dimensions
+# for a human to pick up later. When the feature carries no rotation, emit
+# instead a named datum plane (offset from the body's XY plane by the
+# feature's Z position -- editable, visible in the tree) with a dimensioned
+# sketch on it (radius/length/width plus DistanceX/DistanceY or a Coincident
+# constraint pinning the profile to its measured position) and a Pad/Pocket
+# reading its Length from the feature's height. Rotated features (axis-angle
+# or non-zero Euler) fall back to the old primitive path unchanged: an
+# oblique boss's datum plane would need a matching AttachmentOffset rotation,
+# which is fragile to get right for arbitrary measured axes -- not worth the
+# risk to a feature that already renders correctly as a primitive.
+# ---------------------------------------------------------------------------
+
+
+_DIMENSIONED_PRIMITIVE_TYPES = {"additive_cylinder", "subtractive_cylinder", "additive_box"}
+
+
+def _placement_xyz(placement: Optional[Dict[str, Any]]) -> tuple[float, float, float]:
+    """Return the (x, y, z) position stored in a placement payload."""
+    if not placement:
+        return (0.0, 0.0, 0.0)
+    position = placement.get("position") or [0.0, 0.0, 0.0]
+    x = float(position[0] if len(position) > 0 else 0.0)
+    y = float(position[1] if len(position) > 1 else 0.0)
+    z = float(position[2] if len(position) > 2 else 0.0)
+    return (x, y, z)
+
+
+def _placement_has_rotation(placement: Optional[Dict[str, Any]]) -> bool:
+    """Return True when a placement payload carries a non-trivial rotation."""
+    if not placement:
+        return False
+    if placement.get("rotation_axis"):
+        return True
+    rotation = placement.get("rotation") or [0.0, 0.0, 0.0]
+    return any(abs(float(component)) > 1e-9 for component in rotation)
+
+
+def _z_token(value: float) -> str:
+    """Render a Z offset as a label-safe token, e.g. 7.5 -> '7_5'."""
+    return _safe_name(f"{value:.6g}")
+
+
+def _emit_datum_plane(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    feature_counter: int,
+    feat_name: str,
+    z: float,
+) -> str:
+    """Emit a named datum plane offset from the body's XY plane by *z*.
+
+    The offset lives on the datum plane's AttachmentOffset, so it stays
+    visible and editable in the tree rather than being buried in a raw
+    Placement on the padded/pocketed feature.
+    """
+    dp_var = f"dp_{body_name}_{feature_counter}"
+    dp_label = _safe_name(f"DP_{feat_name}_z{_z_token(z)}")
+    lines.append(f"{dp_var} = {body_var}.newObject('PartDesign::Plane', '{dp_label}')")
+    lines.append(
+        f"{dp_var}.AttachmentSupport = [(_body_origin_ref({body_var}, 'XY_Plane'), '')]"
+    )
+    lines.append(f"{dp_var}.MapMode = 'FlatFace'")
+    lines.append(
+        f"{dp_var}.AttachmentOffset = FreeCAD.Placement("
+        f"FreeCAD.Vector(0, 0, {z}), FreeCAD.Rotation())"
+    )
+    return dp_var
+
+
+def _emit_circle_profile_sketch(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    feature_counter: int,
+    feat_name: str,
+    radius: float,
+    cx: float,
+    cy: float,
+    z: float,
+) -> str:
+    """Emit a datum plane + dimensioned circle sketch for a cylinder feature.
+
+    Driving constraints: a Radius constraint on the circle, and either a
+    Coincident-to-origin constraint (center at/near the sketch origin) or
+    DistanceX/DistanceY constraints pinning the measured center -- so the
+    profile stays fully constrained and editable, not just "correct by
+    construction".
+    """
+    dp_var = _emit_datum_plane(lines, body_var, body_name, feature_counter, feat_name, z)
+
+    sketch_var = f"sketch_{body_name}_{feature_counter}"
+    sketch_label = _safe_name(f"Sketch_{feat_name}")
+    lines.append(f"{sketch_var} = {body_var}.newObject('Sketcher::SketchObject', '{sketch_label}')")
+    lines.append(f"{sketch_var}.AttachmentSupport = [({dp_var}, '')]")
+    lines.append(f"{sketch_var}.MapMode = 'FlatFace'")
+    geo_var = f"{sketch_var}_geo"
+    lines.append(
+        f"{geo_var} = {sketch_var}.addGeometry(Part.Circle("
+        f"FreeCAD.Vector({cx}, {cy}, 0), FreeCAD.Vector(0, 0, 1), {radius}), False)"
+    )
+    lines.append(
+        f"{sketch_var}.addConstraint(Sketcher.Constraint('Radius', {geo_var}, {radius}))"
+    )
+    if abs(cx) < 1e-9 and abs(cy) < 1e-9:
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'Coincident', {geo_var}, 3, -1, 1))"
+        )
+    else:
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'DistanceX', {geo_var}, 3, {cx}))"
+        )
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'DistanceY', {geo_var}, 3, {cy}))"
+        )
+    return sketch_var
+
+
+def _emit_rect_profile_sketch(
+    lines: List[str],
+    body_var: str,
+    body_name: str,
+    feature_counter: int,
+    feat_name: str,
+    length: float,
+    width: float,
+    x: float,
+    y: float,
+    z: float,
+) -> str:
+    """Emit a datum plane + dimensioned rectangle sketch for a box feature.
+
+    The rectangle's first corner lands at the feature's (x, y) position
+    (matching PartDesign::AdditiveBox's own corner-at-Placement.Base
+    convention), driven by DistanceX/DistanceY constraints (or a Coincident
+    to the sketch origin when that corner sits at/near (0, 0)); the two
+    adjacent edges carry the driving length/width dimensions.
+    """
+    dp_var = _emit_datum_plane(lines, body_var, body_name, feature_counter, feat_name, z)
+
+    sketch_var = f"sketch_{body_name}_{feature_counter}"
+    sketch_label = _safe_name(f"Sketch_{feat_name}")
+    lines.append(f"{sketch_var} = {body_var}.newObject('Sketcher::SketchObject', '{sketch_label}')")
+    lines.append(f"{sketch_var}.AttachmentSupport = [({dp_var}, '')]")
+    lines.append(f"{sketch_var}.MapMode = 'FlatFace'")
+
+    corners = [(x, y), (x + length, y), (x + length, y + width), (x, y + width)]
+    g = [f"{sketch_var}_g{i}" for i in range(4)]
+    for i in range(4):
+        start = corners[i]
+        end = corners[(i + 1) % 4]
+        lines.append(
+            f"{g[i]} = {sketch_var}.addGeometry(Part.LineSegment("
+            f"FreeCAD.Vector({start[0]}, {start[1]}, 0), "
+            f"FreeCAD.Vector({end[0]}, {end[1]}, 0)), False)"
+        )
+    for i in range(4):
+        j = (i + 1) % 4
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'Coincident', {g[i]}, 2, {g[j]}, 1))"
+        )
+    lines.append(f"{sketch_var}.addConstraint(Sketcher.Constraint('Horizontal', {g[0]}))")
+    lines.append(f"{sketch_var}.addConstraint(Sketcher.Constraint('Horizontal', {g[2]}))")
+    lines.append(f"{sketch_var}.addConstraint(Sketcher.Constraint('Vertical', {g[1]}))")
+    lines.append(f"{sketch_var}.addConstraint(Sketcher.Constraint('Vertical', {g[3]}))")
+    if abs(x) < 1e-9 and abs(y) < 1e-9:
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'Coincident', {g[0]}, 1, -1, 1))"
+        )
+    else:
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'DistanceX', {g[0]}, 1, {x}))"
+        )
+        lines.append(
+            f"{sketch_var}.addConstraint(Sketcher.Constraint("
+            f"'DistanceY', {g[0]}, 1, {y}))"
+        )
+    lines.append(
+        f"{sketch_var}.addConstraint(Sketcher.Constraint("
+        f"'DistanceX', {g[0]}, 1, {g[0]}, 2, {length}))"
+    )
+    lines.append(
+        f"{sketch_var}.addConstraint(Sketcher.Constraint("
+        f"'DistanceY', {g[1]}, 1, {g[1]}, 2, {width}))"
+    )
+    return sketch_var
+
+
 def _dominant_axis(direction: Any) -> tuple[str, bool, bool]:
     """Resolve a direction vector to the closest body-origin axis."""
     if not isinstance(direction, (list, tuple)) or len(direction) != 3:
@@ -579,6 +780,11 @@ def _gen_bodies(project: dict) -> List[str]:
     # re-drilled bore hollow back out any island fused inside its own
     # footprint (volume campaign iteration 5: the socket core pin).
     deferred_ops: List[tuple[str, str, str, Dict[str, Any]]] = []
+    # Remember the first (additive/subtractive) cylinder's center per body,
+    # so a helper Datum Line can be dropped on the body's main axis after its
+    # features are emitted -- a reference for later manual work, not used by
+    # any downstream geometry.
+    first_cylinder_center: Dict[str, tuple[float, float]] = {}
 
     for body in bodies:
         body_name = _safe_name(body.get("name", "Body"))
@@ -672,14 +878,51 @@ def _gen_bodies(project: dict) -> List[str]:
             feature_counter += 1
             feat_var = f"feat_{body_name}_{feature_counter}_{_safe_name(feat_type)}"
 
-            if feat_type in primitive_map:
+            placement = feat.get("placement") or feat_props.get("placement")
+
+            if feat_type in _DIMENSIONED_PRIMITIVE_TYPES and not _placement_has_rotation(placement):
+                x, y, z = _placement_xyz(placement)
+                if feat_type in ("additive_cylinder", "subtractive_cylinder"):
+                    radius = float(feat.get("radius", feat_props.get("radius", feat_props.get("Radius", 5.0))))
+                    height = float(feat.get("height", feat_props.get("height", feat_props.get("Height", 10.0))))
+                    if body_var not in first_cylinder_center:
+                        first_cylinder_center[body_var] = (x, y)
+                    sketch_var = _emit_circle_profile_sketch(
+                        lines, body_var, body_name, feature_counter, feat_name, radius, x, y, z
+                    )
+                    op_class = "PartDesign::Pad" if feat_type == "additive_cylinder" else "PartDesign::Pocket"
+                    lines.append(f"{feat_var} = {body_var}.newObject('{op_class}', '{feat_name}')")
+                    lines.append(f"{feat_var}.Profile = {sketch_var}")
+                    lines.append(f"{sketch_var}.Visibility = False")
+                    lines.append(f"{feat_var}.Length = {height}")
+                    if feat_type == "subtractive_cylinder":
+                        # PartDesign::Pocket cuts opposite the sketch normal
+                        # by default (-Z here); Reversed=True matches the old
+                        # PartDesign::SubtractiveCylinder primitive, which
+                        # (like its additive counterpart) removes material
+                        # extending in +Z from its Placement.Base.
+                        lines.append(f"{feat_var}.Reversed = True")
+                else:  # additive_box
+                    length = float(feat.get("length", feat_props.get("length", feat_props.get("Length", 10.0))))
+                    width = float(feat.get("width", feat_props.get("width", feat_props.get("Width", 10.0))))
+                    height = float(feat.get("height", feat_props.get("height", feat_props.get("Height", 10.0))))
+                    sketch_var = _emit_rect_profile_sketch(
+                        lines, body_var, body_name, feature_counter, feat_name, length, width, x, y, z
+                    )
+                    lines.append(f"{feat_var} = {body_var}.newObject('PartDesign::Pad', '{feat_name}')")
+                    lines.append(f"{feat_var}.Profile = {sketch_var}")
+                    lines.append(f"{sketch_var}.Visibility = False")
+                    lines.append(f"{feat_var}.Length = {height}")
+                previous_var = feat_var
+
+            elif feat_type in primitive_map:
                 class_name, *prop_pairs = primitive_map[feat_type]
                 lines.append(f"{feat_var} = {body_var}.newObject('{class_name}', '{feat_name}')")
                 for prop_name, key in prop_pairs:
                     value = feat.get(key, feat_props.get(key))
                     if value is not None:
                         lines.append(f"{feat_var}.{prop_name} = {float(value)}")
-                placement_expr = _placement_expr(feat.get("placement") or feat_props.get("placement"))
+                placement_expr = _placement_expr(placement)
                 if placement_expr:
                     lines.append(f"{feat_var}.Placement = {placement_expr}")
                 previous_var = feat_var
@@ -838,6 +1081,20 @@ def _gen_bodies(project: dict) -> List[str]:
                     f"for '{feat_name}'"
                 )
 
+            lines.append("")
+
+        if body_var in first_cylinder_center:
+            # Helper axis on the body's main axis (through the first
+            # cylinder feature's center), for later manual reference -- not
+            # consumed by any downstream feature or export.
+            cx, cy = first_cylinder_center[body_var]
+            axis_var = f"axis_{body_name}"
+            axis_label = _safe_name(f"DA_{body_name}_axis")
+            lines.append(f"{axis_var} = {body_var}.newObject('PartDesign::Line', '{axis_label}')")
+            lines.append(
+                f"{axis_var}.Placement = FreeCAD.Placement("
+                f"FreeCAD.Vector({cx}, {cy}, 0), FreeCAD.Rotation())"
+            )
             lines.append("")
 
     if (
