@@ -949,6 +949,27 @@ def _gen_bodies(project: dict) -> List[str]:
             "            return origin_obj",
             "    raise RuntimeError(f'Could not resolve body origin role: {role}')",
             "",
+            "def _swept_rect(sk, x0, y0, x1, y1):",
+            "    # fully-constrained axis-aligned rectangle for a swept-groove profile",
+            "    import Part as _P, Sketcher as _S",
+            "    pts = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]",
+            "    g = []",
+            "    for i in range(4):",
+            "        a = pts[i]; b = pts[(i + 1) % 4]",
+            "        g.append(sk.addGeometry(_P.LineSegment("
+            "FreeCAD.Vector(a[0], a[1], 0), FreeCAD.Vector(b[0], b[1], 0)), False))",
+            "    for i in range(4):",
+            "        sk.addConstraint(_S.Constraint('Coincident', g[i], 2, g[(i + 1) % 4], 1))",
+            "    for e in (0, 2):",
+            "        sk.addConstraint(_S.Constraint('Horizontal', g[e]))",
+            "    for e in (1, 3):",
+            "        sk.addConstraint(_S.Constraint('Vertical', g[e]))",
+            "    sk.addConstraint(_S.Constraint('DistanceX', g[0], 1, x0))",
+            "    sk.addConstraint(_S.Constraint('DistanceX', g[1], 1, x1))",
+            "    sk.addConstraint(_S.Constraint('DistanceY', g[0], 1, y0))",
+            "    sk.addConstraint(_S.Constraint('DistanceY', g[2], 1, y1))",
+            "    return g",
+            "",
             "def _finishing_edges(shape, spec):",
             "    if spec == 'all':",
             "        return ['Edge%d' % (index + 1) for index in range(len(shape.Edges))]",
@@ -1478,6 +1499,15 @@ def _gen_bodies(project: dict) -> List[str]:
                 bayonet_cuts.append((body_var, feat_name, feat))
                 body_has_doc_level[body_var] = True
 
+            elif feat_type == "swept_groove":
+                # Dimensioned bayonet L-channel realised in-tree: an axial
+                # insertion Pocket + a partial detent Groove, PolarPattern'd.
+                # rotation binds to Groove.Angle and count to the pattern's
+                # Occurrences -- the two G4 editability knobs.
+                previous_var = _emit_swept_groove(
+                    lines, body_var, feat_name, feat_var, feat, previous_var
+                )
+
             elif feat_type in ("additive_section_loft", "subtractive_section_loft"):
                 is_additive = feat_type == "additive_section_loft"
                 after_cuts = bool(feat.get("after_cuts"))
@@ -1985,6 +2015,91 @@ def _gen_export(
     lines.append("")
 
     return lines
+
+
+def _emit_swept_groove(
+    lines: list,
+    body_var: str,
+    feat_name: str,
+    feat_var: str,
+    feat: Dict[str, Any],
+    previous_var: Optional[str],
+) -> Optional[str]:
+    """Emit a dimensioned bayonet L-channel (slot Pocket + detent Groove) and a
+    PolarPattern over both, with explicit BaseFeature/Tip chaining.
+
+    Returns the pattern feature var (the new tip), or ``previous_var`` when the
+    channel cannot be built (no base solid yet).
+    """
+    if previous_var is None:
+        lines.append(f"# WARNING: swept_groove '{feat_name}' needs a base solid feature")
+        return previous_var
+
+    name = _safe_name(feat_name)
+    r = float(feat.get("wall_radius", 6.217))
+    depth = float(feat.get("depth", 0.9))
+    width = float(feat.get("width", 1.8))
+    sz0 = float(feat.get("slot_z0", 13.0))
+    sz1 = float(feat.get("slot_z1", 16.041))
+    dz = float(feat.get("detent_z", 13.0))
+    rotation = float(feat.get("rotation", 90.0))
+    count = int(feat.get("count", 2))
+    over = float(feat.get("overcut", 0.6))
+    x0 = r - depth        # channel floor radius
+    x1 = r + over         # clears the wall
+
+    slot_sk = f"{feat_var}_slot_sk"
+    slot_cut = f"{feat_var}_slot"
+    det_sk = f"{feat_var}_det_sk"
+    det_grv = f"{feat_var}_detent"
+    zax = f"{feat_var}_zaxis"
+
+    lines.append("doc.recompute()")
+    lines.append(f"{zax} = {body_var}.Origin.OriginFeatures[2]  # neck Z axis")
+    # --- axial insertion slot: rect sketch on XZ, midplane Pocket -----------
+    lines.append(f"{slot_sk} = {body_var}.newObject('Sketcher::SketchObject', '{name}_Slot')")
+    lines.append(
+        f"{slot_sk}.Placement = FreeCAD.Placement(FreeCAD.Vector(0,0,0), "
+        f"FreeCAD.Rotation(FreeCAD.Vector(1,0,0), 90))"
+    )
+    lines.append(
+        f"_swept_rect({slot_sk}, {x0!r}, {sz0!r}, {x1!r}, {sz1!r})"
+    )
+    lines.append(f"{slot_cut} = {body_var}.newObject('PartDesign::Pocket', '{name}_Slot')")
+    lines.append(f"{slot_cut}.Profile = {slot_sk}")
+    lines.append(f"{slot_cut}.Midplane = True")
+    lines.append(f"{slot_cut}.Length = {width!r}")
+    lines.append(f"{slot_cut}.BaseFeature = {previous_var}")
+    lines.append(f"{body_var}.Tip = {slot_cut}")
+    lines.append(f"{slot_sk}.Visibility = False")
+    lines.append("doc.recompute()")
+    # --- circumferential detent: rect sketch on XZ, partial Groove ----------
+    lines.append(f"{det_sk} = {body_var}.newObject('Sketcher::SketchObject', '{name}_Detent')")
+    lines.append(
+        f"{det_sk}.Placement = FreeCAD.Placement(FreeCAD.Vector(0,0,0), "
+        f"FreeCAD.Rotation(FreeCAD.Vector(1,0,0), 90))"
+    )
+    lines.append(
+        f"_swept_rect({det_sk}, {x0!r}, {dz - width/2.0!r}, {x1!r}, {dz + width/2.0!r})"
+    )
+    lines.append(f"{det_grv} = {body_var}.newObject('PartDesign::Groove', '{name}_Detent')")
+    lines.append(f"{det_grv}.Profile = {det_sk}")
+    lines.append(f"{det_grv}.ReferenceAxis = ({det_sk}, ['V_Axis'])")
+    lines.append(f"{det_grv}.Angle = {rotation!r}  # G4b knob: channel_rotation")
+    lines.append(f"{det_grv}.BaseFeature = {slot_cut}")
+    lines.append(f"{body_var}.Tip = {det_grv}")
+    lines.append(f"{det_sk}.Visibility = False")
+    lines.append("doc.recompute()")
+    # --- PolarPattern over both channel features ----------------------------
+    lines.append(f"{feat_var} = {body_var}.newObject('PartDesign::PolarPattern', '{name}')")
+    lines.append(f"{feat_var}.Originals = [{slot_cut}, {det_grv}]")
+    lines.append(f"{feat_var}.BaseFeature = {previous_var}")
+    lines.append(f"{feat_var}.Axis = ({zax}, [''])")
+    lines.append(f"{feat_var}.Angle = 360.0")
+    lines.append(f"{feat_var}.Occurrences = {count}  # G4a knob: channel_count")
+    lines.append(f"{body_var}.Tip = {feat_var}")
+    lines.append("doc.recompute()")
+    return feat_var
 
 
 # ---------------------------------------------------------------------------

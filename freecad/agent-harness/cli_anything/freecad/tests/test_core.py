@@ -48,6 +48,7 @@ from cli_anything.freecad.core.body import (
     additive_cylinder,
     additive_section_loft,
     bayonet_groove,
+    swept_groove,
     chamfer,
     create_body,
     datum_plane,
@@ -734,6 +735,78 @@ class TestBody:
         assert ".Base = body_Neck" in macro
         # the second channel is rotated by 180 deg (symmetry=2): 130 -> 310
         assert "310.0" in macro
+
+    def test_swept_groove_feature_recorded(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_cylinder(proj, body_index=0, radius=6.217, height=7.87)
+        feat = swept_groove(
+            proj, body_index=0, wall_radius=6.217, depth=0.9, width=1.8,
+            slot_z0=13.0, slot_z1=16.041, detent_z=13.0, rotation=90.0, count=2,
+        )
+        assert feat["type"] == "swept_groove"
+        assert feat["rotation"] == 90.0
+        assert feat["count"] == 2
+        assert feat["depth"] == 0.9
+        assert feat["width"] == 1.8
+
+    def test_swept_groove_validation(self):
+        proj = {"bodies": [], "sketches": [], "parts": []}
+        create_body(proj)
+        additive_cylinder(proj, body_index=0, radius=6.217, height=7.87)
+        # empty body cannot take a groove
+        empty = {"bodies": [], "sketches": [], "parts": []}
+        create_body(empty)
+        with pytest.raises(ValueError):
+            swept_groove(empty, body_index=0, wall_radius=6.2, depth=0.9, width=1.8,
+                         slot_z0=13.0, slot_z1=16.0, detent_z=13.0)
+        # depth must be inside the wall
+        with pytest.raises(ValueError):
+            swept_groove(proj, body_index=0, wall_radius=6.2, depth=7.0, width=1.8,
+                         slot_z0=13.0, slot_z1=16.0, detent_z=13.0)
+        # rotation out of range
+        with pytest.raises(ValueError):
+            swept_groove(proj, body_index=0, wall_radius=6.2, depth=0.9, width=1.8,
+                         slot_z0=13.0, slot_z1=16.0, detent_z=13.0, rotation=0.0)
+        # count must be >= 1
+        with pytest.raises(ValueError):
+            swept_groove(proj, body_index=0, wall_radius=6.2, depth=0.9, width=1.8,
+                         slot_z0=13.0, slot_z1=16.0, detent_z=13.0, count=0)
+
+    def test_macro_binds_swept_groove_knobs(self):
+        from cli_anything.freecad.utils.freecad_macro_gen import generate_macro
+
+        project = {
+            "name": "swept-demo",
+            "parts": [],
+            "boolean_ops": [],
+            "bodies": [
+                {
+                    "id": 1,
+                    "name": "Neck",
+                    "features": [
+                        {"id": 1, "type": "additive_cylinder", "name": "NeckWall",
+                         "radius": 6.217, "height": 7.87},
+                        {
+                            "id": 2, "type": "swept_groove", "name": "Bayonet",
+                            "wall_radius": 6.217, "depth": 0.9, "width": 1.8,
+                            "slot_z0": 13.0, "slot_z1": 16.041, "detent_z": 13.0,
+                            "rotation": 90.0, "count": 2,
+                        },
+                    ],
+                }
+            ],
+        }
+        macro = generate_macro(project, "/tmp/out.fcstd", export_format="fcstd")
+        # helper for the fully-constrained rectangular profile is emitted
+        assert "def _swept_rect(" in macro
+        # the detent extent binds to Groove.Angle (G4b knob)
+        assert ".Angle = 90.0  # G4b knob: channel_rotation" in macro
+        # the channel count binds to PolarPattern.Occurrences (G4a knob)
+        assert ".Occurrences = 2  # G4a knob: channel_count" in macro
+        # both channel features are patterned together
+        assert "PartDesign::PolarPattern" in macro
+        assert "PartDesign::Groove" in macro
 
     def test_macro_anchors_per_segment_radius_and_depth(self):
         from cli_anything.freecad.utils.freecad_macro_gen import generate_macro

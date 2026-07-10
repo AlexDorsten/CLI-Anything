@@ -435,6 +435,103 @@ def bayonet_groove(
     return feature
 
 
+def swept_groove(
+    project: Dict[str, Any],
+    body_index: int,
+    wall_radius: float,
+    depth: float,
+    width: float,
+    slot_z0: float,
+    slot_z1: float,
+    detent_z: float,
+    rotation: float = 90.0,
+    count: int = 2,
+    overcut: float = 0.6,
+) -> Dict[str, Any]:
+    """Add a dimensioned, parametric bayonet L-channel to a body.
+
+    Unlike :func:`bayonet_groove` (which wraps a raw swept sector solid on the
+    wall), this feature realises the channel as an editable PartDesign chain:
+
+    * an axial insertion **slot** -- a ``Pocket`` of the rectangular
+      cross-section (``depth`` x ``width``) over ``slot_z0..slot_z1``; and
+    * a circumferential **detent** -- a partial ``Groove`` (revolve) of the same
+      cross-section at ``detent_z`` swept through ``rotation`` degrees.
+
+    ``count`` angular copies are produced by a ``PolarPattern`` about the neck
+    axis.  ``rotation`` and ``count`` are the two G4 editability knobs: the
+    detent extent binds directly to ``Groove.Angle`` and the number of channels
+    to ``PolarPattern.Occurrences``, so a variant is a pure parameter edit.
+
+    Parameters
+    ----------
+    project:
+        The project dictionary.
+    body_index:
+        Index of the target body (the neck).
+    wall_radius:
+        Outer radius of the intact neck wall (the channel cuts inward).
+    depth:
+        Radial depth of the channel (``wall_radius - depth`` is the floor).
+    width:
+        Cross-section width (axial for the detent, tangential for the slot).
+    slot_z0, slot_z1:
+        Axial extent of the insertion slot (``slot_z1`` is the open rim end).
+    detent_z:
+        Axial centre of the circumferential detent.
+    rotation:
+        Detent rotation extent in degrees (``Groove.Angle``; G4b knob).
+    count:
+        Number of equally spaced channel copies (``PolarPattern.Occurrences``;
+        two for a two-start bayonet).
+    overcut:
+        Extra radial reach beyond the wall so the cut fully clears the surface.
+
+    Returns
+    -------
+    Dict[str, Any]
+        The newly created swept groove feature dictionary.
+    """
+    _validate_project(project)
+    body = _get_body(project, body_index)
+
+    if not body["features"]:
+        raise ValueError("Cannot add a swept groove to a body with no existing features")
+
+    wall_radius = float(wall_radius)
+    depth = float(depth)
+    width = float(width)
+    if wall_radius <= 0:
+        raise ValueError(f"Wall radius must be positive, got {wall_radius}")
+    if not 0 < depth < wall_radius:
+        raise ValueError(f"Groove depth must be in (0, wall_radius), got {depth}")
+    if width <= 0:
+        raise ValueError(f"Channel width must be positive, got {width}")
+    if float(slot_z1) <= float(slot_z0):
+        raise ValueError("slot_z1 must be greater than slot_z0")
+    if not 0 < float(rotation) <= 360:
+        raise ValueError(f"Detent rotation must be in (0, 360], got {rotation}")
+    if int(count) < 1:
+        raise ValueError(f"Channel count must be >= 1, got {count}")
+
+    feature: Dict[str, Any] = {
+        "id": _next_feature_id(body),
+        "type": "swept_groove",
+        "wall_radius": wall_radius,
+        "depth": depth,
+        "width": width,
+        "slot_z0": float(slot_z0),
+        "slot_z1": float(slot_z1),
+        "detent_z": float(detent_z),
+        "rotation": float(rotation),
+        "count": int(count),
+        "overcut": float(overcut),
+    }
+
+    body["features"].append(feature)
+    return feature
+
+
 def chamfer(
     project: Dict[str, Any],
     body_index: int,
